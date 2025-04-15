@@ -1,6 +1,8 @@
 # app/routes.py
 
+import os
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import RedirectResponse
 import httpx
 from app.config import (
     PAYPAL_CLIENT_ID,
@@ -11,6 +13,44 @@ from app.config import (
 from typing import Any, Dict
 
 router = APIRouter()
+
+@router.get("/payment/success")
+async def payment_success(custom_id: str):
+    """
+    This endpoint is the return URL for PayPal. After payment, PayPal redirects the user here.
+    The endpoint sends a confirmation message to the Telegram bot (using the custom_id, which is the Telegram user id)
+    and then redirects the user to a Telegram join link.
+    """
+    # Send a confirmation message via Telegram
+    TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+    telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    message = (
+        "Your payment was successful and your subscription is now active! "
+        "You should have access to the VIP Telegram group shortly."
+    )
+    payload = {
+        "chat_id": custom_id,  # Assumes custom_id is the Telegram user id
+        "text": message
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(telegram_api_url, json=payload)
+            response.raise_for_status()
+        except Exception as e:
+            print("Error notifying Telegram:", e)
+    
+    # Redirect the user to the Telegram group join URL.
+    telegram_group_link = "https://t.me/NeuralBetsFREE"  # Replace with your actual join link
+    # Optionally, you can instead return an HTMLResponse that informs the user and includes a clickable link:
+    # return HTMLResponse(
+    #    f"<html><body><h2>Payment successful!</h2>"
+    #    f"<p>You will be redirected shortly. If not, <a href='{telegram_group_link}'>click here</a>.</p></body></html>"
+    # )
+    
+    # Automatic redirect:
+    return RedirectResponse(telegram_group_link)
 
 @router.get("/create_subscription")
 async def create_subscription(user_id: str):
@@ -44,8 +84,8 @@ async def create_subscription(user_id: str):
     subscription_payload = {
         "plan_id": plan_id,
         "application_context": {
-            "return_url": "https://t.me/+9PTO3KKDwQRiMjM5",
-            "cancel_url": "https://yourapp.com/payment/cancel",
+            "return_url": "https://your-project-name.up.railway.app/payment/success?custom_id={user_id}",
+            "cancel_url": "https://your-project-name.up.railway.app/payment/cancel",
         },
         "custom_id": user_id
     }
@@ -74,39 +114,40 @@ async def paypal_webhook(request: Request):
     """
     Handle incoming PayPal webhook events. For security, verify signature.
     """
-
     try:
-        event = await request.json()
+        # Parse the JSON body once and store it.
+        event_body = await request.json()
         # Log the event for debugging.
         print("Received PayPal webhook event:")
-        print(event)
+        print(event_body)
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid webhook payload.")
 
-    # # 1. Parse the JSON body
-    # event_body = await request.json()
-    # event_headers = request.headers
+    # Retrieve headers for verification.
+    event_headers = request.headers
 
-    # # 2. (Optional but recommended) Verify the webhook signature
-    # verification_status = await verify_paypal_webhook_signature(event_headers, event_body)
-    # if not verification_status:
-    #     raise HTTPException(status_code=400, detail="Invalid PayPal webhook signature")
+    # (Optional but recommended) Verify the webhook signature.
+    verification_status = await verify_paypal_webhook_signature(event_headers, event_body)
+    if not verification_status:
+        raise HTTPException(status_code=400, detail="Invalid PayPal webhook signature")
 
-    # # 3. Handle the event
-    # event_type = event_body.get("event_type")
-
-    # # For subscription events like BILLING.SUBSCRIPTION.ACTIVATED, CANCELLED, etc.
-    # if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
-    #     # Update your database to mark the subscription as active
-    #     pass
-    # elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
-    #     # Mark subscription as canceled, schedule user removal from chat, etc.
-    #     pass
-    # elif event_type == "PAYMENT.SALE.COMPLETED":
-    #     # A payment was completed; you might record transaction details
-    #     pass
+    # Process the event.
+    event_type = event_body.get("event_type")
+    if event_type == "BILLING.SUBSCRIPTION.ACTIVATED":
+        # Update your database to mark the subscription as active.
+        print("Subscription activated for custom_id:", event_body.get("resource", {}).get("custom_id"))
+        # e.g., update_user_subscription_status(custom_id, "active")
+    elif event_type == "BILLING.SUBSCRIPTION.CANCELLED":
+        print("Subscription cancelled.")
+        # e.g., update_user_subscription_status(custom_id, "cancelled")
+    elif event_type == "PAYMENT.SALE.COMPLETED":
+        print("A payment was completed.")
+        # e.g., record_transaction_details(event_body)
+    else:
+        print("Unhandled event type:", event_type)
 
     return {"status": "success", "message": "Event processed"}
+
 
 
 async def verify_paypal_webhook_signature(headers: Any, body: Dict):
