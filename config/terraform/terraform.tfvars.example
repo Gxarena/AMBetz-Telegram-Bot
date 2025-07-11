@@ -1,0 +1,16 @@
+# GCP Configuration
+project_id = "your-gcp-project-id"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# Telegram Configuration
+telegram_bot_token = "your-telegram-bot-token"
+
+# Stripe Configuration
+stripe_secret_key      = "sk_live_or_test_your_stripe_secret_key"
+stripe_publishable_key = "pk_live_or_test_your_stripe_publishable_key"
+stripe_webhook_secret  = "whsec_your_stripe_webhook_secret"
+stripe_price_id        = "price_your_stripe_price_id"
+
+# Optional: VIP Chat ID for group management
+vip_chat_id = "your-telegram-group-chat-id" 
