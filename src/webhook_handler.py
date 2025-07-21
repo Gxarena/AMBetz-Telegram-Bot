@@ -104,6 +104,7 @@ async def stripe_webhook(request: Request):
         if event.type == 'checkout.session.completed':
             session = event.data.object
             logger.info(f"Payment completed for session: {session.id}")
+            logger.info(f"Session data: {session}")
             
             # Process the successful payment
             subscription_data = stripe_service.handle_successful_payment(session)
@@ -127,11 +128,14 @@ async def stripe_webhook(request: Request):
                     # Generate and send one-time invite links
                     try:
                         bot_app = await get_bot_application()
-                        telegram_bot = GCPTelegramBot()
                         
                         # Get user info for username
                         user_info = firestore_service.get_user(subscription_data['telegram_id'])
                         username = user_info.get("username") if user_info else None
+                        
+                        # Create bot instance and set up application
+                        telegram_bot = GCPTelegramBot()
+                        telegram_bot.application = bot_app
                         
                         # Generate one-time invite links
                         invite_links = await telegram_bot.generate_one_time_invite_links(
