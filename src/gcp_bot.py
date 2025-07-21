@@ -1,3 +1,5 @@
+# AMBetz VIP Telegram Bot
+# Updated: Force redeploy to pick up new Stripe test keys
 import os
 import logging
 import asyncio
