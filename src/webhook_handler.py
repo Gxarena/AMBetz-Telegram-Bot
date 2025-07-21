@@ -123,6 +123,41 @@ async def stripe_webhook(request: Request):
                 
                 if success:
                     logger.info(f"Subscription created for user {subscription_data['telegram_id']}")
+                    
+                    # Generate and send one-time invite links
+                    try:
+                        bot_app = await get_bot_application()
+                        telegram_bot = GCPTelegramBot()
+                        
+                        # Get user info for username
+                        user_info = firestore_service.get_user(subscription_data['telegram_id'])
+                        username = user_info.get("username") if user_info else None
+                        
+                        # Generate one-time invite links
+                        invite_links = await telegram_bot.generate_one_time_invite_links(
+                            subscription_data['telegram_id'], 
+                            username
+                        )
+                        
+                        # Send invite links to user
+                        await telegram_bot.send_vip_invite_links(
+                            subscription_data['telegram_id'],
+                            invite_links,
+                            username
+                        )
+                        
+                        logger.info(f"Sent invite links to user {subscription_data['telegram_id']}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to send invite links to user {subscription_data['telegram_id']}: {e}")
+                        # Send fallback message
+                        try:
+                            await bot_app.bot.send_message(
+                                chat_id=subscription_data['telegram_id'],
+                                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact support for your invite links."
+                            )
+                        except Exception as fallback_error:
+                            logger.error(f"Failed to send fallback message: {fallback_error}")
                 else:
                     logger.error(f"Failed to save subscription for user {subscription_data['telegram_id']}")
             else:

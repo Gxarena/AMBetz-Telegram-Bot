@@ -129,7 +129,7 @@ class GCPTelegramBot:
             f"• MLB\n"
             f"• UCL\n"
             f"• And much more!\n\n"
-            f"Join our VIP group to get exclusive daily picks and maximize your winnings!",
+            f"Join our VIP groups to get exclusive daily picks and maximize your winnings!",
             reply_markup=reply_markup
         )
         logger.info(f"User {username} (ID: {user_id}) started the bot")
@@ -251,11 +251,11 @@ class GCPTelegramBot:
 1. Use /start to see subscription options
 2. Click "Subscribe" to begin payment process
 3. Complete payment securely through Stripe
-4. Get instant access to VIP announcements and discussion groups!
+4. Receive exclusive one-time invite links for VIP groups!
 
 *VIP Groups:*
-• **Announcements Group**: Daily picks and betting tips
-• **Discussion Group**: Chat with other VIP members
+• **Announcements Channel**: Daily picks and betting tips (one-time invite link)
+• **Discussion Group**: Chat with other VIP members (one-time invite link)
 
 *Need Help?*
 Contact support if you have any questions about your subscription.
@@ -464,6 +464,87 @@ Contact support if you have any questions about your subscription.
                         logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
         except Exception as e:
             logger.error(f"Error in check_expired_subscriptions: {e}")
+
+    async def generate_one_time_invite_links(self, user_id: int, username: str = None) -> Dict[str, str]:
+        """Generate one-time invite links for VIP channel and group"""
+        invite_links = {}
+        
+        # Generate invite link for VIP announcements group (if configured)
+        if self.vip_announcements_id:
+            try:
+                invite_link = await self.application.bot.create_chat_invite_link(
+                    chat_id=self.vip_announcements_id,
+                    name=f"VIP Access for {username or user_id}",
+                    creates_join_request=False,
+                    expire_date=datetime.utcnow() + timedelta(hours=24),  # Expire in 24 hours
+                    member_limit=1  # One-time use
+                )
+                invite_links['announcements'] = invite_link.invite_link
+                logger.info(f"Generated one-time invite link for announcements group for user {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to generate invite link for announcements group: {e}")
+        
+        # Generate invite link for VIP discussion group (if configured)
+        if self.vip_discussion_id:
+            try:
+                invite_link = await self.application.bot.create_chat_invite_link(
+                    chat_id=self.vip_discussion_id,
+                    name=f"VIP Access for {username or user_id}",
+                    creates_join_request=False,
+                    expire_date=datetime.utcnow() + timedelta(hours=24),  # Expire in 24 hours
+                    member_limit=1  # One-time use
+                )
+                invite_links['discussion'] = invite_link.invite_link
+                logger.info(f"Generated one-time invite link for discussion group for user {user_id}")
+            except Exception as e:
+                logger.error(f"Failed to generate invite link for discussion group: {e}")
+        
+        return invite_links
+
+    async def send_vip_invite_links(self, user_id: int, invite_links: Dict[str, str], username: str = None):
+        """Send VIP invite links to the user"""
+        try:
+            message = "🎉 **Welcome to AMBetz VIP!** 🎉\n\n"
+            message += "Your subscription is now active! Here are your exclusive invite links:\n\n"
+            
+            if 'announcements' in invite_links:
+                message += "📢 **VIP Announcements Channel**\n"
+                message += "Get daily picks and betting tips:\n"
+                message += f"👉 {invite_links['announcements']}\n\n"
+            
+            if 'discussion' in invite_links:
+                message += "💬 **VIP Discussion Group**\n"
+                message += "Chat with other VIP members:\n"
+                message += f"👉 {invite_links['discussion']}\n\n"
+            
+            message += "⚠️ **Important:**\n"
+            message += "• These links are **one-time use only**\n"
+            message += "• They expire in **24 hours**\n"
+            message += "• **Do not share** these links with others\n"
+            message += "• Use them immediately to join the VIP groups\n\n"
+            
+            message += "🎯 **Next Steps:**\n"
+            message += "1. Click the links above to join both groups\n"
+            message += "2. Start receiving daily VIP picks\n"
+            message += "3. Connect with other VIP members\n\n"
+            
+            message += "Use `/status` to check your subscription anytime!"
+            
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                parse_mode="Markdown"
+            )
+            
+            logger.info(f"Sent VIP invite links to user {username} (ID: {user_id})")
+            
+        except Exception as e:
+            logger.error(f"Failed to send VIP invite links to user {user_id}: {e}")
+            # Fallback message
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact support for your invite links."
+            )
 
     def setup_application(self) -> Application:
         """Setup and configure the Telegram application"""

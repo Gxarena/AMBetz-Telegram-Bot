@@ -66,10 +66,6 @@ class GCPStripeService:
                         "quantity": 1,
                     },
                 ],
-                after_completion={
-                    "type": "redirect",
-                    "redirect": {"url": "https://t.me/your_bot_username"}  # Replace with your bot username
-                },
                 metadata={
                     "telegram_id": str(telegram_id),
                     "telegram_username": telegram_username or "",
