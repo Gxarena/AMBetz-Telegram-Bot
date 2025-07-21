@@ -161,12 +161,21 @@ class GCPTelegramBot:
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /help is issued."""
         help_text = """
+🎮🏀🏒⚾ *AMBetz VIP Betting Tips*
+
 *Available Commands:*
-/start - Start the bot
+/start - Welcome message and subscription options
+/status - Check your current subscription status
 /help - Show this help message
-/status - Check your subscription status
-/test - Create a test subscription (development only)
-/expire - Expire your subscription immediately (testing only)
+
+*How to Subscribe:*
+1. Use /start to see subscription options
+2. Click "Subscribe" to begin payment process
+3. Complete payment securely through Stripe
+4. Get instant access to VIP group!
+
+*Need Help?*
+Contact support if you have any questions about your subscription.
 """
         await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -354,8 +363,16 @@ class GCPTelegramBot:
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("test", self.test_command))
-        self.application.add_handler(CommandHandler("expire", self.expire_command))
+        
+        # Add development commands only if in development mode
+        is_development = os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true'
+        if is_development:
+            self.application.add_handler(CommandHandler("test", self.test_command))
+            self.application.add_handler(CommandHandler("expire", self.expire_command))
+            logger.info("Development commands (/test, /expire) enabled")
+        else:
+            logger.info("Production mode: Development commands disabled")
+        
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
         # Set up job to check for expired subscriptions (every 1 hour)
