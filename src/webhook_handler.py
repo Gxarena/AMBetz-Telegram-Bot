@@ -94,7 +94,7 @@ async def stripe_webhook(request: Request):
         # Parse the event
         try:
             logger.info(f"Raw payload type: {type(payload)}")
-            logger.info(f"Raw payload: {payload.decode('utf-8')[:500]}...")  # First 500 chars
+            logger.info(f"Raw payload: {payload.decode('utf-8')}")  # First 500 chars
             
             event = stripe.Event.construct_from(
                 payload.decode('utf-8'), stripe.api_key
@@ -108,10 +108,17 @@ async def stripe_webhook(request: Request):
         
         # Handle the event
         if event.type == 'checkout.session.completed':
+            logger.info("Processing checkout.session.completed event")
             session = event.data.object
-            logger.info(f"Payment completed for session: {session.id}")
-            logger.info(f"Session data type: {type(session)}")
-            logger.info(f"Session data: {session}")
+            logger.info(f"Session object type: {type(session)}")
+            logger.info(f"Session object attributes: {dir(session)}")
+            
+            try:
+                session_id = session.id
+                logger.info(f"Session ID: {session_id}")
+            except Exception as e:
+                logger.error(f"Error accessing session.id: {e}")
+                raise
             
             try:
                 # Process the successful payment
