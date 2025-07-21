@@ -93,9 +93,15 @@ async def stripe_webhook(request: Request):
         
         # Parse the event
         try:
+            logger.info(f"Raw payload type: {type(payload)}")
+            logger.info(f"Raw payload: {payload.decode('utf-8')[:500]}...")  # First 500 chars
+            
             event = stripe.Event.construct_from(
                 payload.decode('utf-8'), stripe.api_key
             )
+            logger.info(f"Event type: {type(event)}")
+            logger.info(f"Event data type: {type(event.data)}")
+            logger.info(f"Event data object type: {type(event.data.object)}")
         except ValueError as e:
             logger.error(f"Invalid payload: {e}")
             raise HTTPException(status_code=400, detail="Invalid payload")
