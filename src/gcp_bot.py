@@ -49,14 +49,33 @@ class GCPTelegramBot:
         if not self.bot_token:
             raise ValueError("Telegram bot token not found in Secret Manager")
         
-        # Get VIP chat ID from Secret Manager (optional)
-        vip_chat_id_str = self._get_secret("vip-chat-id")
-        self.vip_chat_id = int(vip_chat_id_str) if vip_chat_id_str else None
+        # Get VIP chat IDs from Secret Manager (optional)
+        vip_announcements_id_str = self._get_secret("vip-announcements-id")
+        vip_discussion_id_str = self._get_secret("vip-discussion-id")
         
-        if self.vip_chat_id:
-            logger.info(f"VIP chat ID configured: {self.vip_chat_id}")
-        else:
-            logger.warning("VIP chat ID not configured. Group management features will be disabled.")
+        self.vip_announcements_id = int(vip_announcements_id_str) if vip_announcements_id_str else None
+        self.vip_discussion_id = int(vip_discussion_id_str) if vip_discussion_id_str else None
+        
+        # For backward compatibility, also check the old single vip_chat_id
+        if not self.vip_announcements_id and not self.vip_discussion_id:
+            vip_chat_id_str = self._get_secret("vip-chat-id")
+            if vip_chat_id_str:
+                self.vip_announcements_id = int(vip_chat_id_str)
+                logger.info(f"Using legacy vip-chat-id for announcements: {self.vip_announcements_id}")
+        
+        # Get admin Telegram ID for notifications (optional)
+        admin_id_str = self._get_secret("admin-telegram-id")
+        self.admin_telegram_id = int(admin_id_str) if admin_id_str else None
+        
+        if self.vip_announcements_id:
+            logger.info(f"VIP announcements chat ID configured: {self.vip_announcements_id}")
+        if self.vip_discussion_id:
+            logger.info(f"VIP discussion chat ID configured: {self.vip_discussion_id}")
+        if self.admin_telegram_id:
+            logger.info(f"Admin Telegram ID configured: {self.admin_telegram_id}")
+        
+        if not self.vip_announcements_id and not self.vip_discussion_id:
+            logger.warning("No VIP chat IDs configured. Group management features will be disabled.")
         
         # Initialize Telegram application
         self.application = None
@@ -158,6 +177,64 @@ class GCPTelegramBot:
             logger.error(f"Error in status_command: {e}")
             await update.message.reply_text(f"❌ Error checking subscription status: {e}")
 
+    async def add_user_to_vip_groups(self, user_id: int, username: str = None) -> bool:
+        """Add user to both VIP groups (announcements and discussion)"""
+        success = True
+        
+        if self.vip_announcements_id:
+            try:
+                await self.application.bot.unban_chat_member(
+                    chat_id=self.vip_announcements_id,
+                    user_id=user_id,
+                    only_if_banned=True
+                )
+                logger.info(f"Added user {username} (ID: {user_id}) to VIP announcements group")
+            except Exception as e:
+                logger.error(f"Failed to add user {user_id} to VIP announcements group: {e}")
+                success = False
+        
+        if self.vip_discussion_id:
+            try:
+                await self.application.bot.unban_chat_member(
+                    chat_id=self.vip_discussion_id,
+                    user_id=user_id,
+                    only_if_banned=True
+                )
+                logger.info(f"Added user {username} (ID: {user_id}) to VIP discussion group")
+            except Exception as e:
+                logger.error(f"Failed to add user {user_id} to VIP discussion group: {e}")
+                success = False
+        
+        return success
+
+    async def notify_admin_user_kicked(self, user_id: int, username: str = None, reason: str = "subscription expired") -> None:
+        """Send notification to admin when a user is kicked from VIP group"""
+        if not self.admin_telegram_id:
+            logger.warning("No admin Telegram ID configured. Skipping admin notification.")
+            return
+        
+        try:
+            user_display = f"@{username}" if username else f"User ID: {user_id}"
+            message = (
+                f"🚫 **User Kicked from VIP Group**\n\n"
+                f"**User:** {user_display}\n"
+                f"**User ID:** `{user_id}`\n"
+                f"**Reason:** {reason}\n"
+                f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                f"⚠️ **Action Required:** Please manually remove this user from the VIP channel as well."
+            )
+            
+            await self.application.bot.send_message(
+                chat_id=self.admin_telegram_id,
+                text=message,
+                parse_mode="Markdown"
+            )
+            
+            logger.info(f"Admin notification sent for kicked user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to send admin notification for user {user_id}: {e}")
+
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /help is issued."""
         help_text = """
@@ -172,7 +249,11 @@ class GCPTelegramBot:
 1. Use /start to see subscription options
 2. Click "Subscribe" to begin payment process
 3. Complete payment securely through Stripe
-4. Get instant access to VIP group!
+4. Get instant access to VIP announcements and discussion groups!
+
+*VIP Groups:*
+• **Announcements Group**: Daily picks and betting tips
+• **Discussion Group**: Chat with other VIP members
 
 *Need Help?*
 Contact support if you have any questions about your subscription.
@@ -299,9 +380,10 @@ Contact support if you have any questions about your subscription.
 
     async def check_expired_subscriptions(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Check for expired subscriptions and take action."""
-        if not self.vip_chat_id:
-            logger.warning("VIP_CHAT_ID not set. Cannot remove users from group.")
-            
+        if not self.vip_announcements_id and not self.vip_discussion_id:
+            logger.warning("No VIP chat IDs configured. Cannot remove users from groups.")
+            return
+        
         logger.info("Checking for expired subscriptions...")
         
         try:
@@ -324,19 +406,22 @@ Contact support if you have any questions about your subscription.
                 logger.info(f"Marked subscription for user {telegram_id} as expired")
                 
                 # Try to remove user from the VIP group (if configured)
-                if self.vip_chat_id:
+                if self.vip_announcements_id:
                     try:
                         user_info = self.firestore_service.get_user(telegram_id)
                         username = user_info.get("username", "Unknown") if user_info else "Unknown"
                         
                         # Ban the user from the group for a short time (this effectively removes them)
                         await context.bot.ban_chat_member(
-                            chat_id=self.vip_chat_id,
+                            chat_id=self.vip_announcements_id,
                             user_id=telegram_id,
                             until_date=datetime.now() + timedelta(seconds=35)  # Minimum time
                         )
                         
-                        logger.info(f"Removed user {username} (ID: {telegram_id}) from VIP group")
+                        logger.info(f"Removed user {username} (ID: {telegram_id}) from VIP announcements group")
+                        
+                        # Notify the admin about the kick
+                        await self.notify_admin_user_kicked(telegram_id, username, "subscription expired")
                         
                         # Notify the user
                         try:
@@ -348,7 +433,33 @@ Contact support if you have any questions about your subscription.
                         except Exception as e:
                             logger.error(f"Could not notify user {telegram_id} about removal: {e}")
                     except Exception as e:
-                        logger.error(f"Failed to remove user {telegram_id} from VIP group: {e}")
+                        logger.error(f"Failed to remove user {telegram_id} from VIP announcements group: {e}")
+                
+                if self.vip_discussion_id:
+                    try:
+                        user_info = self.firestore_service.get_user(telegram_id)
+                        username = user_info.get("username", "Unknown") if user_info else "Unknown"
+                        
+                        # Ban the user from the group for a short time (this effectively removes them)
+                        await context.bot.ban_chat_member(
+                            chat_id=self.vip_discussion_id,
+                            user_id=telegram_id,
+                            until_date=datetime.now() + timedelta(seconds=35)  # Minimum time
+                        )
+                        
+                        logger.info(f"Removed user {username} (ID: {telegram_id}) from VIP discussion group")
+                        
+                        # Notify the user
+                        try:
+                            await context.bot.send_message(
+                                chat_id=telegram_id,
+                                text="⚠️ Your subscription has expired and you have been removed from the VIP group. "
+                                    "Please renew your subscription to regain access."
+                            )
+                        except Exception as e:
+                            logger.error(f"Could not notify user {telegram_id} about removal: {e}")
+                    except Exception as e:
+                        logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
         except Exception as e:
             logger.error(f"Error in check_expired_subscriptions: {e}")
 

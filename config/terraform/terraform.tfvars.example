@@ -13,4 +13,11 @@ stripe_webhook_secret  = "whsec_your_stripe_webhook_secret"
 stripe_price_id        = "price_your_stripe_price_id"
 
 # Optional: VIP Chat ID for group management
-vip_chat_id = "your-telegram-group-chat-id" 
+vip_chat_id = "your-telegram-group-chat-id"
+
+# Optional: VIP Chat IDs for dual-group setup (recommended)
+vip_announcements_id = "your-announcements-group-chat-id"
+vip_discussion_id = "your-discussion-group-chat-id"
+
+# Optional: Admin Telegram ID for kick notifications
+admin_telegram_id = "your-admin-telegram-id" 

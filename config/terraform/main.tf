@@ -72,6 +72,24 @@ variable "vip_chat_id" {
   default     = ""
 }
 
+variable "vip_announcements_id" {
+  description = "VIP Announcements Chat ID (optional)"
+  type        = string
+  default     = ""
+}
+
+variable "vip_discussion_id" {
+  description = "VIP Discussion Chat ID (optional)"
+  type        = string
+  default     = ""
+}
+
+variable "admin_telegram_id" {
+  description = "Admin Telegram ID for notifications (optional)"
+  type        = string
+  default     = ""
+}
+
 # Enable required APIs
 resource "google_project_service" "required_apis" {
   for_each = toset([
@@ -200,6 +218,57 @@ resource "google_secret_manager_secret_version" "vip_chat_id" {
   
   secret      = google_secret_manager_secret.vip_chat_id[0].id
   secret_data = var.vip_chat_id
+}
+
+resource "google_secret_manager_secret" "vip_announcements_id" {
+  count = var.vip_announcements_id != "" ? 1 : 0
+  
+  secret_id = "vip-announcements-id"
+  
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "vip_announcements_id" {
+  count = var.vip_announcements_id != "" ? 1 : 0
+  
+  secret      = google_secret_manager_secret.vip_announcements_id[0].id
+  secret_data = var.vip_announcements_id
+}
+
+resource "google_secret_manager_secret" "vip_discussion_id" {
+  count = var.vip_discussion_id != "" ? 1 : 0
+  
+  secret_id = "vip-discussion-id"
+  
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "vip_discussion_id" {
+  count = var.vip_discussion_id != "" ? 1 : 0
+  
+  secret      = google_secret_manager_secret.vip_discussion_id[0].id
+  secret_data = var.vip_discussion_id
+}
+
+resource "google_secret_manager_secret" "admin_telegram_id" {
+  count = var.admin_telegram_id != "" ? 1 : 0
+  
+  secret_id = "admin-telegram-id"
+  
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_version" "admin_telegram_id" {
+  count = var.admin_telegram_id != "" ? 1 : 0
+  
+  secret      = google_secret_manager_secret.admin_telegram_id[0].id
+  secret_data = var.admin_telegram_id
 }
 
 # Service account for Cloud Run
