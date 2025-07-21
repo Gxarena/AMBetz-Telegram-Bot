@@ -104,10 +104,17 @@ async def stripe_webhook(request: Request):
         if event.type == 'checkout.session.completed':
             session = event.data.object
             logger.info(f"Payment completed for session: {session.id}")
+            logger.info(f"Session data type: {type(session)}")
             logger.info(f"Session data: {session}")
             
-            # Process the successful payment
-            subscription_data = stripe_service.handle_successful_payment(session)
+            try:
+                # Process the successful payment
+                subscription_data = stripe_service.handle_successful_payment(session)
+                logger.info(f"Subscription data: {subscription_data}")
+            except Exception as e:
+                logger.error(f"Error in handle_successful_payment: {e}")
+                logger.error(f"Session object: {session}")
+                raise
             
             if subscription_data:
                 # Save subscription to Firestore

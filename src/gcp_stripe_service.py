@@ -131,16 +131,24 @@ class GCPStripeService:
         """Handle successful payment and return subscription info"""
         try:
             # Extract metadata - handle both dict and Stripe object
+            logger.info(f"Session data type: {type(session_data)}")
+            logger.info(f"Session data attributes: {dir(session_data)}")
+            
             if hasattr(session_data, 'metadata'):
                 metadata = session_data.metadata
+                logger.info(f"Metadata from attribute: {metadata}")
             else:
                 metadata = session_data.get("metadata", {})
+                logger.info(f"Metadata from get(): {metadata}")
             
             # Get telegram_id from metadata
+            logger.info(f"Metadata type: {type(metadata)}")
             if hasattr(metadata, 'get'):
                 telegram_id = metadata.get("telegram_id")
+                logger.info(f"Telegram ID from get(): {telegram_id}")
             else:
                 telegram_id = getattr(metadata, 'telegram_id', None)
+                logger.info(f"Telegram ID from getattr(): {telegram_id}")
             
             if not telegram_id:
                 logger.error("No telegram_id in payment metadata")
