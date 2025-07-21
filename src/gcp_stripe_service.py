@@ -127,31 +127,61 @@ class GCPStripeService:
             logger.error("Invalid signature")
             return False
     
-    def handle_successful_payment(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_successful_payment(self, session_data) -> Dict[str, Any]:
         """Handle successful payment and return subscription info"""
         try:
-            # Extract metadata
-            metadata = session_data.get("metadata", {})
-            telegram_id = metadata.get("telegram_id")
+            # Extract metadata - handle both dict and Stripe object
+            if hasattr(session_data, 'metadata'):
+                metadata = session_data.metadata
+            else:
+                metadata = session_data.get("metadata", {})
+            
+            # Get telegram_id from metadata
+            if hasattr(metadata, 'get'):
+                telegram_id = metadata.get("telegram_id")
+            else:
+                telegram_id = getattr(metadata, 'telegram_id', None)
             
             if not telegram_id:
                 logger.error("No telegram_id in payment metadata")
+                logger.error(f"Metadata: {metadata}")
                 return None
             
             # Calculate subscription dates
             start_date = datetime.utcnow()
             expiry_date = start_date + timedelta(days=30)  # Adjust based on your subscription period
             
+            # Get session data - handle both dict and Stripe object
+            if hasattr(session_data, 'customer'):
+                customer_id = session_data.customer
+            else:
+                customer_id = session_data.get("customer")
+            
+            if hasattr(session_data, 'id'):
+                session_id = session_data.id
+            else:
+                session_id = session_data.get("id")
+            
+            if hasattr(session_data, 'amount_total'):
+                amount_total = session_data.amount_total
+            else:
+                amount_total = session_data.get("amount_total", 0)
+            
+            if hasattr(session_data, 'currency'):
+                currency = session_data.currency
+            else:
+                currency = session_data.get("currency", "usd")
+            
             subscription_data = {
                 "telegram_id": int(telegram_id),
-                "stripe_customer_id": session_data.get("customer"),
-                "stripe_session_id": session_data.get("id"),
+                "stripe_customer_id": customer_id,
+                "stripe_session_id": session_id,
                 "status": "active",
                 "subscription_type": "premium",  # Adjust based on your product
                 "start_date": start_date,
                 "expiry_date": expiry_date,
-                "amount_paid": session_data.get("amount_total", 0) / 100,  # Convert from cents
-                "currency": session_data.get("currency", "usd"),
+                "amount_paid": amount_total / 100,  # Convert from cents
+                "currency": currency,
                 "updated_at": datetime.utcnow()
             }
             
@@ -160,4 +190,6 @@ class GCPStripeService:
             
         except Exception as e:
             logger.error(f"Error handling successful payment: {e}")
+            logger.error(f"Session data type: {type(session_data)}")
+            logger.error(f"Session data: {session_data}")
             return None 
