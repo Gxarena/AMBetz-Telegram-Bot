@@ -253,26 +253,135 @@ async def stripe_webhook(request: Request):
 async def check_expired_subscriptions():
     """Endpoint to manually trigger expired subscription check"""
     try:
-        # Get bot application for VIP group management
+        # Find expired subscriptions
+        expired_subscriptions = firestore_service.find_expired_subscriptions()
+        
+        if not expired_subscriptions:
+            logger.info("No expired subscriptions found")
+            return JSONResponse(content={
+                "status": "success",
+                "expired_count": 0,
+                "message": "No expired subscriptions found"
+            })
+        
+        # Get bot application
         bot_app = await get_bot_application()
         
-        # Create bot instance and properly set up the application
-        telegram_bot = GCPTelegramBot()
-        telegram_bot.application = bot_app
+        # Process each expired subscription
+        kicked_count = 0
+        for subscription in expired_subscriptions:
+            telegram_id = subscription.get('telegram_id')
+            if not telegram_id:
+                continue
+                
+            try:
+                # Mark as expired in Firestore
+                success = firestore_service.mark_subscription_expired(telegram_id)
+                if not success:
+                    logger.error(f"Failed to mark subscription expired for user {telegram_id}")
+                    continue
+                
+                # Get user info for notifications
+                user_info = firestore_service.get_user(telegram_id)
+                username = user_info.get("username") if user_info else None
+                
+                # Try to remove from VIP announcements channel
+                vip_announcements_id_str = firestore_service._get_secret("vip-announcements-id") if hasattr(firestore_service, '_get_secret') else None
+                if not vip_announcements_id_str:
+                    # Get from secret manager directly
+                    from google.cloud import secretmanager
+                    client = secretmanager.SecretManagerServiceClient()
+                    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+                    try:
+                        secret_name = f"projects/{project_id}/secrets/vip-announcements-id/versions/latest"
+                        response = client.access_secret_version(request={"name": secret_name})
+                        vip_announcements_id_str = response.payload.data.decode("UTF-8").strip()
+                    except Exception:
+                        vip_announcements_id_str = None
+                
+                if vip_announcements_id_str:
+                    try:
+                        vip_announcements_id = int(vip_announcements_id_str)
+                        await bot_app.bot.ban_chat_member(
+                            chat_id=vip_announcements_id,
+                            user_id=telegram_id
+                        )
+                        # Unban immediately (this removes from group but allows rejoining later)
+                        await bot_app.bot.unban_chat_member(
+                            chat_id=vip_announcements_id,
+                            user_id=telegram_id
+                        )
+                        logger.info(f"Removed user {telegram_id} from VIP announcements group")
+                    except Exception as e:
+                        logger.error(f"Failed to remove user {telegram_id} from VIP announcements group: {e}")
+                
+                # Try to remove from VIP discussion group
+                vip_discussion_id_str = firestore_service._get_secret("vip-chat-id") if hasattr(firestore_service, '_get_secret') else None
+                if not vip_discussion_id_str:
+                    try:
+                        secret_name = f"projects/{project_id}/secrets/vip-chat-id/versions/latest"
+                        response = client.access_secret_version(request={"name": secret_name})
+                        vip_discussion_id_str = response.payload.data.decode("UTF-8").strip()
+                    except Exception:
+                        vip_discussion_id_str = None
+                
+                if vip_discussion_id_str:
+                    try:
+                        vip_discussion_id = int(vip_discussion_id_str)
+                        await bot_app.bot.ban_chat_member(
+                            chat_id=vip_discussion_id,
+                            user_id=telegram_id
+                        )
+                        # Unban immediately (this removes from group but allows rejoining later)
+                        await bot_app.bot.unban_chat_member(
+                            chat_id=vip_discussion_id,
+                            user_id=telegram_id
+                        )
+                        logger.info(f"Removed user {telegram_id} from VIP discussion group")
+                    except Exception as e:
+                        logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
+                
+                # Send expiry notification to user
+                try:
+                    await bot_app.bot.send_message(
+                        chat_id=telegram_id,
+                        text="⚠️ Your subscription has expired and you have been removed from the VIP groups. Use /start to renew your subscription."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send expiry notification to user {telegram_id}: {e}")
+                
+                # Send admin notification
+                admin_id_str = None
+                try:
+                    secret_name = f"projects/{project_id}/secrets/admin-telegram-id/versions/latest"
+                    response = client.access_secret_version(request={"name": secret_name})
+                    admin_id_str = response.payload.data.decode("UTF-8").strip()
+                except Exception:
+                    pass
+                
+                if admin_id_str:
+                    try:
+                        admin_id = int(admin_id_str)
+                        await bot_app.bot.send_message(
+                            chat_id=admin_id,
+                            text=f"🚫 User {username or telegram_id} has been removed from VIP groups due to subscription expiry."
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send admin notification: {e}")
+                
+                kicked_count += 1
+                logger.info(f"Successfully processed expired subscription for user {telegram_id}")
+                
+            except Exception as e:
+                logger.error(f"Error processing expired subscription for user {telegram_id}: {e}")
         
-        # Initialize the bot's services
-        telegram_bot.firestore_service = firestore_service
-        telegram_bot.stripe_service = stripe_service
-        
-        # Use the bot's built-in expiry check which handles everything
-        # (finding expired, marking as expired, removing from groups, sending notifications)
-        await telegram_bot.check_expired_subscriptions(None)
-        
-        logger.info(f"Processed expired subscriptions check via bot logic")
+        logger.info(f"Processed {len(expired_subscriptions)} expired subscriptions, kicked {kicked_count} users")
         
         return JSONResponse(content={
             "status": "success",
-            "message": "Expired subscription check completed via bot logic"
+            "expired_count": len(expired_subscriptions),
+            "kicked_count": kicked_count,
+            "message": f"Processed {len(expired_subscriptions)} expired subscriptions"
         })
         
     except Exception as e:
