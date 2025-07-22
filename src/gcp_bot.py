@@ -341,6 +341,20 @@ Contact AM if you have any questions about your subscription.
         await query.answer()
         
         if query.data == "subscribe":
+            # Check if user already has an active subscription
+            user_id = update.effective_user.id
+            existing_subscription = self.firestore_service.get_subscription(user_id)
+            if existing_subscription and existing_subscription.get('status') == 'active':
+                expiry_date = existing_subscription['expiry_date']
+                await query.message.reply_text(
+                    f"❌ **Subscription Already Active**\n\n"
+                    f"You already have an active subscription that expires on:\n"
+                    f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                    f"You cannot subscribe again until your current subscription expires.\n\n"
+                    f"Use `/status` to check your current subscription."
+                )
+                return
+            
             # Check if Stripe is configured
             if self.stripe_service.is_configured:
                 try:

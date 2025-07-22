@@ -8,6 +8,7 @@ from firestore_service import FirestoreService
 from gcp_stripe_service import GCPStripeService
 from gcp_bot import GCPTelegramBot
 import json
+from datetime import timedelta
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -144,7 +145,30 @@ async def stripe_webhook(request: Request):
                 raise
             
             if subscription_data:
-                # Save subscription to Firestore
+                # Check if user already has an active subscription
+                existing_subscription = firestore_service.get_subscription(subscription_data['telegram_id'])
+                if existing_subscription and existing_subscription.get('status') == 'active':
+                    logger.warning(f"User {subscription_data['telegram_id']} attempted to subscribe while already having active subscription")
+                    
+                    # Send message to user explaining they can't subscribe again
+                    try:
+                        bot_app = await get_bot_application()
+                        expiry_date = existing_subscription['expiry_date']
+                        await bot_app.bot.send_message(
+                            chat_id=subscription_data['telegram_id'],
+                            text=f"❌ **Subscription Already Active**\n\n"
+                                 f"You already have an active subscription that expires on:\n"
+                                 f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                                 f"You cannot subscribe again until your current subscription expires.\n\n"
+                                 f"Use `/status` to check your current subscription."
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send subscription blocked message: {e}")
+                    
+                    # Return success to Stripe but don't create new subscription
+                    return JSONResponse(content={"status": "success", "message": "subscription_blocked"})
+                
+                # Save subscription to Firestore (only if no active subscription exists)
                 success = firestore_service.upsert_subscription(
                     telegram_id=subscription_data['telegram_id'],
                     start_date=subscription_data['start_date'],
