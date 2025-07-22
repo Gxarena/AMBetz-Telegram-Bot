@@ -143,12 +143,26 @@ class GCPStripeService:
             
             # Get telegram_id from metadata
             logger.info(f"Metadata type: {type(metadata)}")
-            if hasattr(metadata, 'get'):
-                telegram_id = metadata.get("telegram_id")
-                logger.info(f"Telegram ID from get(): {telegram_id}")
-            else:
-                telegram_id = getattr(metadata, 'telegram_id', None)
-                logger.info(f"Telegram ID from getattr(): {telegram_id}")
+            logger.info(f"Metadata content: {metadata}")
+            
+            try:
+                if isinstance(metadata, dict):
+                    telegram_id = metadata.get("telegram_id")
+                    logger.info(f"Telegram ID from dict.get(): {telegram_id}")
+                elif hasattr(metadata, 'get'):
+                    telegram_id = metadata.get("telegram_id")
+                    logger.info(f"Telegram ID from object.get(): {telegram_id}")
+                elif hasattr(metadata, 'telegram_id'):
+                    telegram_id = getattr(metadata, 'telegram_id', None)
+                    logger.info(f"Telegram ID from getattr(): {telegram_id}")
+                else:
+                    logger.error(f"Metadata is neither dict nor object with get/telegram_id: {type(metadata)}")
+                    telegram_id = None
+            except Exception as e:
+                logger.error(f"Error accessing telegram_id from metadata: {e}")
+                logger.error(f"Metadata type: {type(metadata)}")
+                logger.error(f"Metadata content: {metadata}")
+                telegram_id = None
             
             if not telegram_id:
                 logger.error("No telegram_id in payment metadata")
