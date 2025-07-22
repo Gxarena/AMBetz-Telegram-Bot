@@ -109,15 +109,19 @@ async def stripe_webhook(request: Request):
         # Handle the event
         if event.type == 'checkout.session.completed':
             logger.info("Processing checkout.session.completed event")
-            session = event.data.object
-            logger.info(f"Session object type: {type(session)}")
-            logger.info(f"Session object attributes: {dir(session)}")
+            logger.info(f"Event data type: {type(event.data)}")
+            logger.info(f"Event data object type: {type(event.data.object)}")
             
             try:
+                session = event.data.object
+                logger.info(f"Session object type: {type(session)}")
+                logger.info(f"Session object attributes: {dir(session)}")
+                
                 session_id = session.id
                 logger.info(f"Session ID: {session_id}")
             except Exception as e:
-                logger.error(f"Error accessing session.id: {e}")
+                logger.error(f"Error accessing session object: {e}")
+                logger.error(f"Event data: {event.data}")
                 raise
             
             try:
