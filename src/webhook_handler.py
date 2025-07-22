@@ -122,6 +122,13 @@ async def stripe_webhook(request: Request):
                 
                 session_id = session.id
                 logger.info(f"Session ID: {session_id}")
+                
+                # Check if this session was already processed to prevent duplicates
+                existing_subscription = firestore_service.get_subscription_by_stripe_session(session_id)
+                if existing_subscription:
+                    logger.info(f"Session {session_id} already processed, skipping duplicate")
+                    return JSONResponse(content={"status": "success", "message": "already_processed"})
+                    
             except Exception as e:
                 logger.error(f"Error accessing session object: {e}")
                 logger.error(f"Event data: {event.data}")
@@ -196,7 +203,7 @@ async def stripe_webhook(request: Request):
                         try:
                             await bot_app.bot.send_message(
                                 chat_id=subscription_data['telegram_id'],
-                                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact support for your invite links."
+                                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact AM for your invite links."
                             )
                         except Exception as fallback_error:
                             logger.error(f"Failed to send fallback message: {fallback_error}")

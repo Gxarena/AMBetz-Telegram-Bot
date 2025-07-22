@@ -171,7 +171,11 @@ class GCPStripeService:
             
             # Calculate subscription dates
             start_date = datetime.utcnow()
-            expiry_date = start_date + timedelta(days=30)  # Adjust based on your subscription period
+            # For testing: 1 minute subscription, for production: 30 days
+            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                expiry_date = start_date + timedelta(minutes=1)  # 1 minute for testing
+            else:
+                expiry_date = start_date + timedelta(days=30)  # 30 days for production
             
             # Get session data - handle both dict and Stripe object
             if hasattr(session_data, 'customer'):

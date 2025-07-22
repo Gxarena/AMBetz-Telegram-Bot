@@ -256,7 +256,7 @@ class GCPTelegramBot:
 • **Discussion Group**: Chat with other VIP members (one-time invite link)
 
 *Need Help?*
-Contact support if you have any questions about your subscription.
+Contact AM if you have any questions about your subscription.
 """
         await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -264,7 +264,11 @@ Contact support if you have any questions about your subscription.
         """Create a test subscription for the user (development purposes)."""
         user_id = update.effective_user.id
         start_date = datetime.utcnow()
-        expiry_date = start_date + timedelta(days=30)  # 30-day subscription
+        # For testing: 1 minute subscription, for production: 30 days
+        if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+            expiry_date = start_date + timedelta(minutes=1)  # 1 minute for testing
+        else:
+            expiry_date = start_date + timedelta(days=30)  # 30 days for production
         
         try:
             success = self.firestore_service.upsert_subscription(
@@ -541,7 +545,7 @@ Contact support if you have any questions about your subscription.
             # Fallback message
             await self.application.bot.send_message(
                 chat_id=user_id,
-                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact support for your invite links."
+                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact AM for your invite links."
             )
 
     def setup_application(self) -> Application:
@@ -567,11 +571,23 @@ Contact support if you have any questions about your subscription.
         
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         
-        # Set up job to check for expired subscriptions (every 1 hour)
+        # Set up job to check for expired subscriptions
         job_queue = self.application.job_queue
         if job_queue:
-            job_queue.run_repeating(self.check_expired_subscriptions, interval=3600, first=10)
-            logger.info("Set up job to check for expired subscriptions every hour")
+            # For testing: check every minute, for production: daily at 9 AM UTC
+            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                # Run every minute for testing (60 seconds)
+                job_queue.run_repeating(self.check_expired_subscriptions, interval=60, first=10)
+                logger.info("Set up job to check for expired subscriptions every minute (development mode)")
+            else:
+                # Calculate seconds until 9 AM UTC tomorrow
+                now = datetime.utcnow()
+                tomorrow_9am = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+                seconds_until_9am = (tomorrow_9am - now).total_seconds()
+                
+                # Run daily at 9 AM UTC (86400 seconds = 24 hours)
+                job_queue.run_repeating(self.check_expired_subscriptions, interval=86400, first=seconds_until_9am)
+                logger.info(f"Set up job to check for expired subscriptions daily at 9 AM UTC (first run in {seconds_until_9am:.0f} seconds)")
         else:
             logger.warning("Job queue not available. Expired subscription checking will be disabled.")
         
