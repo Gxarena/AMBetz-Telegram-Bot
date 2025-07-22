@@ -256,16 +256,17 @@ async def check_expired_subscriptions():
         # Get bot application for VIP group management
         bot_app = await get_bot_application()
         
-        # Create bot instance and set up application
+        # Create bot instance and properly set up the application
         telegram_bot = GCPTelegramBot()
         telegram_bot.application = bot_app
+        
+        # Initialize the bot's services
+        telegram_bot.firestore_service = firestore_service
+        telegram_bot.stripe_service = stripe_service
         
         # Use the bot's built-in expiry check which handles everything
         # (finding expired, marking as expired, removing from groups, sending notifications)
         await telegram_bot.check_expired_subscriptions(None)
-        
-        # Get count of expired subscriptions for response
-        expired_subscriptions = firestore_service.find_expired_subscriptions()
         
         logger.info(f"Processed expired subscriptions check via bot logic")
         

@@ -520,26 +520,26 @@ Contact AM if you have any questions about your subscription.
     async def send_vip_invite_links(self, user_id: int, invite_links: Dict[str, str], username: str = None):
         """Send VIP invite links to the user"""
         try:
-            message = "🎉 **Welcome to AMBetz VIP!** 🎉\n\n"
+            message = "🎉 *Welcome to AMBetz VIP!* 🎉\n\n"
             message += "Your subscription is now active! Here are your exclusive invite links:\n\n"
             
             if 'announcements' in invite_links:
-                message += "📢 **VIP Announcements Channel**\n"
+                message += "📢 *VIP Announcements Channel*\n"
                 message += "Get daily picks and betting tips:\n"
-                message += f"👉 {invite_links['announcements']}\n\n"
+                message += f"👉 `{invite_links['announcements']}`\n\n"
             
             if 'discussion' in invite_links:
-                message += "💬 **VIP Discussion Group**\n"
+                message += "💬 *VIP Discussion Group*\n"
                 message += "Chat with other VIP members:\n"
-                message += f"👉 {invite_links['discussion']}\n\n"
+                message += f"👉 `{invite_links['discussion']}`\n\n"
             
-            message += "⚠️ **Important:**\n"
-            message += "• These links are **one-time use only**\n"
-            message += "• They expire in **24 hours**\n"
-            message += "• **Do not share** these links with others\n"
+            message += "⚠️ *Important:*\n"
+            message += "• These links are *one-time use only*\n"
+            message += "• They expire in *24 hours*\n"
+            message += "• *Do not share* these links with others\n"
             message += "• Use them immediately to join the VIP groups\n\n"
             
-            message += "🎯 **Next Steps:**\n"
+            message += "🎯 *Next Steps:*\n"
             message += "1. Click the links above to join both groups\n"
             message += "2. Start receiving daily VIP picks\n"
             message += "3. Connect with other VIP members\n\n"
@@ -556,11 +556,14 @@ Contact AM if you have any questions about your subscription.
             
         except Exception as e:
             logger.error(f"Failed to send VIP invite links to user {user_id}: {e}")
-            # Fallback message
-            await self.application.bot.send_message(
-                chat_id=user_id,
-                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact AM for your invite links."
-            )
+            # Fallback message without Markdown
+            try:
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact AM for your invite links."
+                )
+            except Exception as fallback_error:
+                logger.error(f"Failed to send fallback message: {fallback_error}")
 
     def setup_application(self) -> Application:
         """Setup and configure the Telegram application"""
