@@ -253,24 +253,25 @@ async def stripe_webhook(request: Request):
 async def check_expired_subscriptions():
     """Endpoint to manually trigger expired subscription check"""
     try:
-        # Find expired subscriptions
+        # Get bot application for VIP group management
+        bot_app = await get_bot_application()
+        
+        # Create bot instance and set up application
+        telegram_bot = GCPTelegramBot()
+        telegram_bot.application = bot_app
+        
+        # Use the bot's built-in expiry check which handles everything
+        # (finding expired, marking as expired, removing from groups, sending notifications)
+        await telegram_bot.check_expired_subscriptions(None)
+        
+        # Get count of expired subscriptions for response
         expired_subscriptions = firestore_service.find_expired_subscriptions()
         
-        # Mark them as expired
-        updated_count = 0
-        for subscription in expired_subscriptions:
-            telegram_id = subscription.get('telegram_id')
-            if telegram_id:
-                success = firestore_service.mark_subscription_expired(telegram_id)
-                if success:
-                    updated_count += 1
-        
-        logger.info(f"Processed {updated_count} expired subscriptions")
+        logger.info(f"Processed expired subscriptions check via bot logic")
         
         return JSONResponse(content={
             "status": "success",
-            "expired_count": len(expired_subscriptions),
-            "updated_count": updated_count
+            "message": "Expired subscription check completed via bot logic"
         })
         
     except Exception as e:
