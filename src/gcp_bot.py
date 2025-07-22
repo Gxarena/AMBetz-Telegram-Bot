@@ -53,17 +53,15 @@ class GCPTelegramBot:
         
         # Get VIP chat IDs from Secret Manager (optional)
         vip_announcements_id_str = self._get_secret("vip-announcements-id")
-        vip_discussion_id_str = self._get_secret("vip-discussion-id")
+        vip_chat_id_str = self._get_secret("vip-chat-id")  # Use existing vip-chat-id for discussion
         
         self.vip_announcements_id = int(vip_announcements_id_str) if vip_announcements_id_str else None
-        self.vip_discussion_id = int(vip_discussion_id_str) if vip_discussion_id_str else None
+        self.vip_discussion_id = int(vip_chat_id_str) if vip_chat_id_str else None
         
-        # For backward compatibility, also check the old single vip_chat_id
-        if not self.vip_announcements_id and not self.vip_discussion_id:
-            vip_chat_id_str = self._get_secret("vip-chat-id")
-            if vip_chat_id_str:
-                self.vip_announcements_id = int(vip_chat_id_str)
-                logger.info(f"Using legacy vip-chat-id for announcements: {self.vip_announcements_id}")
+        # For backward compatibility, if no announcements ID is set, use vip-chat-id for announcements too
+        if not self.vip_announcements_id and vip_chat_id_str:
+            self.vip_announcements_id = int(vip_chat_id_str)
+            logger.info(f"Using vip-chat-id for both announcements and discussion: {self.vip_announcements_id}")
         
         # Get admin Telegram ID for notifications (optional)
         admin_id_str = self._get_secret("admin-telegram-id")
