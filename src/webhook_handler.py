@@ -7,6 +7,7 @@ from telegram import Update
 from firestore_service import FirestoreService
 from gcp_stripe_service import GCPStripeService
 from gcp_bot import GCPTelegramBot
+import json
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -96,9 +97,11 @@ async def stripe_webhook(request: Request):
             logger.info(f"Raw payload type: {type(payload)}")
             logger.info(f"Raw payload: {payload.decode('utf-8')}")  # First 500 chars
             
-            event = stripe.Event.construct_from(
-                payload.decode('utf-8'), stripe.api_key
-            )
+            event_dict = json.loads(payload.decode('utf-8'))
+            event = stripe.Event.construct_from(event_dict, stripe.api_key)
+
+            logger.info(f"Decoded event_dict keys: {list(event_dict.keys())}")
+
             logger.info(f"Event type: {type(event)}")
             logger.info(f"Event data type: {type(event.data)}")
             logger.info(f"Event data object type: {type(event.data.object)}")
@@ -154,8 +157,19 @@ async def stripe_webhook(request: Request):
                         bot_app = await get_bot_application()
                         
                         # Get user info for username
+                        logger.info(f"Getting user info for telegram_id: {subscription_data['telegram_id']}")
                         user_info = firestore_service.get_user(subscription_data['telegram_id'])
-                        username = user_info.get("username") if user_info else None
+                        logger.info(f"User info type: {type(user_info)}")
+                        logger.info(f"User info content: {user_info}")
+                        
+                        try:
+                            username = user_info.get("username") if user_info else None
+                            logger.info(f"Username extracted: {username}")
+                        except Exception as e:
+                            logger.error(f"Error getting username from user_info: {e}")
+                            logger.error(f"User info type: {type(user_info)}")
+                            logger.error(f"User info content: {user_info}")
+                            username = None
                         
                         # Create bot instance and set up application
                         telegram_bot = GCPTelegramBot()
