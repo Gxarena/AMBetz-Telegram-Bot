@@ -526,12 +526,12 @@ Contact AM if you have any questions about your subscription.
             if 'announcements' in invite_links:
                 message += "📢 *VIP Announcements Channel*\n"
                 message += "Get daily picks and betting tips:\n"
-                message += f"👉 `{invite_links['announcements']}`\n\n"
+                message += f"👉 {invite_links['announcements']}\n\n"
             
             if 'discussion' in invite_links:
                 message += "💬 *VIP Discussion Group*\n"
                 message += "Chat with other VIP members:\n"
-                message += f"👉 `{invite_links['discussion']}`\n\n"
+                message += f"👉 {invite_links['discussion']}\n\n"
             
             message += "⚠️ *Important:*\n"
             message += "• These links are *one-time use only*\n"
