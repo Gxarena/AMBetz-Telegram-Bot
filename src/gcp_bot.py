@@ -1,5 +1,4 @@
 # AMBetz VIP Telegram Bot
-# Updated: Force redeploy to pick up new Stripe test keys
 import os
 import logging
 import asyncio
@@ -8,8 +7,8 @@ from typing import Dict, Any
 
 from google.cloud import logging as cloud_logging
 from google.cloud import secretmanager
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from firestore_service import FirestoreService
 from gcp_stripe_service import GCPStripeService
@@ -92,8 +91,19 @@ class GCPTelegramBot:
             # Fallback to environment variables for development
             return os.getenv(secret_name.upper().replace('-', '_'))
 
+    def _is_private_chat(self, update: Update) -> bool:
+        """Check if the current chat is a private chat (PM)"""
+        if not update.effective_chat:
+            return False
+        return update.effective_chat.type == Chat.PRIVATE
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /start is issued."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /start command in group chat {update.effective_chat.id}")
+            return
+        
         # Create keyboard with Subscribe button
         keyboard = [
             [InlineKeyboardButton("Subscribe", callback_data="subscribe")]
@@ -134,6 +144,11 @@ class GCPTelegramBot:
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Check subscription status."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /status command in group chat {update.effective_chat.id}")
+            return
+        
         user_id = update.effective_user.id
         
         try:
@@ -237,6 +252,11 @@ class GCPTelegramBot:
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /help is issued."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /help command in group chat {update.effective_chat.id}")
+            return
+        
         help_text = """
 🎮🏀🏒⚾ *AMBetz VIP Betting Tips*
 
@@ -262,6 +282,11 @@ Contact AM if you have any questions about your subscription.
 
     async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Create a test subscription for the user (development purposes)."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /test command in group chat {update.effective_chat.id}")
+            return
+        
         user_id = update.effective_user.id
         start_date = datetime.utcnow()
         # For testing: 1 minute subscription, for production: 30 days
@@ -293,6 +318,11 @@ Contact AM if you have any questions about your subscription.
 
     async def expire_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Expire the user's subscription immediately (testing purposes)."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /expire command in group chat {update.effective_chat.id}")
+            return
+        
         user_id = update.effective_user.id
         past_date = datetime.utcnow() - timedelta(days=1)  # 1 day ago
         
@@ -337,6 +367,11 @@ Contact AM if you have any questions about your subscription.
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button callbacks."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring button callback in group chat {update.effective_chat.id}")
+            return
+        
         query = update.callback_query
         await query.answer()
         
@@ -395,6 +430,62 @@ Contact AM if you have any questions about your subscription.
         
         elif query.data == "cancel":
             await query.message.reply_text("❌ Subscription cancelled. You can subscribe anytime using /start")
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle all non-command messages. Only respond in private chats."""
+        # # Only respond in private chats
+        # if not self._is_private_chat(update):
+        #     chat_id = update.effective_chat.id
+        #     chat_title = update.effective_chat.title or "Unknown Group"
+        #     logger.info(f"Ignoring message in group chat '{chat_title}' (ID: {chat_id})")
+        #     return
+        
+        # In private chats, we can optionally respond to regular messages
+        # For now, we'll just log them but not respond
+        user_id = update.effective_user.id
+        username = update.effective_user.username
+        first_name = update.effective_user.first_name
+        
+        # Handle different types of messages
+        if update.message.text:
+            message_content = f"Text: {update.message.text}"
+        elif update.message.photo:
+            message_content = f"Photo (caption: {update.message.caption or 'No caption'})"
+        elif update.message.video:
+            message_content = f"Video (caption: {update.message.caption or 'No caption'})"
+        elif update.message.audio:
+            message_content = f"Audio (caption: {update.message.caption or 'No caption'})"
+        elif update.message.document:
+            message_content = f"Document: {update.message.document.file_name or 'Unnamed file'}"
+        elif update.message.sticker:
+            message_content = f"Sticker: {update.message.sticker.emoji or 'No emoji'}"
+        else:
+            message_content = "Other message type"
+        
+        logger.info(f"Received message from user {first_name} (@{username}) (ID: {user_id}) in private chat: {message_content}")
+        
+        # Optionally, you could add a helpful response here
+        # await update.message.reply_text("I only respond to commands. Use /help to see available commands.")
+
+    async def get_chat_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Get chat information (temporary command for getting chat IDs)"""
+        chat = update.effective_chat
+        chat_id = chat.id
+        chat_type = chat.type
+        chat_title = chat.title or "Private Chat"
+        
+        info_message = (
+            f"📝 **Chat Information**\n\n"
+            f"**Chat ID:** `{chat_id}`\n"
+            f"**Type:** {chat_type}\n"
+            f"**Title:** {chat_title}\n"
+        )
+        
+        if chat.username:
+            info_message += f"**Username:** @{chat.username}\n"
+        
+        await update.message.reply_text(info_message, parse_mode="Markdown")
+        logger.info(f"Chat info requested for chat '{chat_title}' (ID: {chat_id})")
 
     async def check_expired_subscriptions(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Check for expired subscriptions and take action."""
@@ -576,6 +667,7 @@ Contact AM if you have any questions about your subscription.
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("chatinfo", self.get_chat_info))
         
         # Add development commands only if in development mode
         is_development = os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true'
@@ -587,6 +679,7 @@ Contact AM if you have any questions about your subscription.
             logger.info("Production mode: Development commands disabled")
         
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
+        self.application.add_handler(MessageHandler(filters.ALL, self.handle_message))
         
         # Set up job to check for expired subscriptions
         job_queue = self.application.job_queue
