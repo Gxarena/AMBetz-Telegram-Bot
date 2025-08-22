@@ -434,11 +434,11 @@ Contact AM if you have any questions about your subscription.
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle all non-command messages. Only respond in private chats."""
         # # Only respond in private chats
-        # if not self._is_private_chat(update):
-        #     chat_id = update.effective_chat.id
-        #     chat_title = update.effective_chat.title or "Unknown Group"
-        #     logger.info(f"Ignoring message in group chat '{chat_title}' (ID: {chat_id})")
-        #     return
+        if not self._is_private_chat(update):
+            chat_id = update.effective_chat.id
+            chat_title = update.effective_chat.title or "Unknown Group"
+            logger.info(f"Ignoring message in group chat '{chat_title}' (ID: {chat_id})")
+            return
         
         # In private chats, we can optionally respond to regular messages
         # For now, we'll just log them but not respond
