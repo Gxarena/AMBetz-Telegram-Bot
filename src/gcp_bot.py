@@ -403,7 +403,6 @@ Contact AM if you have any questions about your subscription.
                     # Send payment link to user
                     keyboard = [
                         [InlineKeyboardButton("💳 Pay Now", url=payment_url)],
-                        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
                     ]
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     
@@ -427,9 +426,6 @@ Contact AM if you have any questions about your subscription.
                     "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
                     "For testing, you can use /test to create a test subscription."
                 )
-        
-        elif query.data == "cancel":
-            await query.message.reply_text("❌ Subscription cancelled. You can subscribe anytime using /start")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle all non-command messages. Only respond in private chats."""
