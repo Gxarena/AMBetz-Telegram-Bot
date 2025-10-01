@@ -300,7 +300,7 @@ resource "google_project_iam_member" "logging_writer" {
 resource "google_cloud_scheduler_job" "expired_subscriptions_check" {
   name      = "check-expired-subscriptions"
   region    = var.region
-  schedule  = "0 */6 * * *"  # Every 6 hours
+  schedule  = "0 5 * * *"  # Daily at 5:00 AM UTC (midnight EST)
   time_zone = "UTC"
 
   http_target {
