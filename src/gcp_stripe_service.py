@@ -79,6 +79,45 @@ class GCPStripeService:
         except Exception as e:
             logger.error(f"Error creating payment link: {e}")
             raise
+
+    def create_subscription_checkout(self, telegram_id: int, telegram_username: str = None) -> str:
+        """Create a Stripe checkout session for recurring subscription"""
+        if not self.is_configured:
+            raise ValueError("Stripe is not configured")
+            
+        try:
+            # Sanitize username to remove problematic Unicode characters
+            sanitized_username = self._sanitize_string(telegram_username) if telegram_username else ""
+            
+            # Create or retrieve customer
+            customer = self.get_or_create_customer(telegram_id, sanitized_username)
+            
+            # Create checkout session for subscription
+            checkout_session = stripe.checkout.Session.create(
+                customer=customer.id,
+                payment_method_types=['card'],
+                line_items=[
+                    {
+                        'price': self.price_id,
+                        'quantity': 1,
+                    },
+                ],
+                mode='subscription',  # This makes it recurring!
+                success_url=f'https://t.me/AMBETZBot?start=success',
+                cancel_url=f'https://t.me/AMBETZBot?start=cancelled',
+                metadata={
+                    "telegram_id": str(telegram_id),
+                    "telegram_username": sanitized_username,
+                    "source": "gcp-bot"
+                }
+            )
+            
+            logger.info(f"Subscription checkout session created for user {telegram_id}")
+            return checkout_session.url
+            
+        except Exception as e:
+            logger.error(f"Error creating subscription checkout: {e}")
+            raise
     
     def get_or_create_customer(self, telegram_id: int, telegram_username: str = None) -> stripe.Customer:
         """Get existing customer or create new one"""
@@ -169,13 +208,20 @@ class GCPStripeService:
                 logger.error(f"Metadata: {metadata}")
                 return None
             
-            # Calculate subscription dates
-            start_date = datetime.utcnow()
-            # For testing: 1 minute subscription, for production: 30 days
-            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
-                expiry_date = start_date + timedelta(minutes=1)  # 1 minute for testing
+            # For subscriptions, get the actual subscription period from Stripe
+            if hasattr(session_data, 'subscription') and session_data.subscription:
+                # This is a subscription checkout, get the subscription details
+                subscription = stripe.Subscription.retrieve(session_data.subscription)
+                start_date = datetime.fromtimestamp(subscription.current_period_start)
+                expiry_date = datetime.fromtimestamp(subscription.current_period_end)
             else:
-                expiry_date = start_date + timedelta(days=30)  # 30 days for production
+                # This is a one-time payment, calculate dates manually
+                start_date = datetime.utcnow()
+                # For testing: 1 minute subscription, for production: 30 days
+                if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                    expiry_date = start_date + timedelta(minutes=1)  # 1 minute for testing
+                else:
+                    expiry_date = start_date + timedelta(days=30)  # 30 days for production
             
             # Get session data - handle both dict and Stripe object
             if hasattr(session_data, 'customer'):
@@ -218,4 +264,45 @@ class GCPStripeService:
             logger.error(f"Error handling successful payment: {e}")
             logger.error(f"Session data type: {type(session_data)}")
             logger.error(f"Session data: {session_data}")
-            return None 
+            return None
+    
+    def _sanitize_string(self, text: str) -> str:
+        """Sanitize string to remove problematic Unicode characters"""
+        if not text:
+            return ""
+        
+        try:
+            # Remove or replace problematic Unicode characters
+            # U+2028: Line Separator, U+2029: Paragraph Separator, U+0000: Null
+            problematic_chars = {
+                '\u2028': ' ',  # Line Separator -> space
+                '\u2029': ' ',  # Paragraph Separator -> space
+                '\u0000': '',   # Null -> empty
+                '\u0001': '',   # Start of Heading -> empty
+                '\u0002': '',   # Start of Text -> empty
+                '\u0003': '',   # End of Text -> empty
+                '\u0004': '',   # End of Transmission -> empty
+                '\u0005': '',   # Enquiry -> empty
+                '\u0006': '',   # Acknowledge -> empty
+                '\u0007': '',   # Bell -> empty
+                '\u0008': '',   # Backspace -> empty
+                '\u000B': '',   # Vertical Tab -> empty
+                '\u000C': '',   # Form Feed -> empty
+                '\u000E': '',   # Shift Out -> empty
+                '\u000F': '',   # Shift In -> empty
+            }
+            
+            sanitized = text
+            for char, replacement in problematic_chars.items():
+                sanitized = sanitized.replace(char, replacement)
+            
+            # Also remove any other control characters
+            sanitized = ''.join(char for char in sanitized if ord(char) >= 32 or char in '\n\r\t')
+            
+            logger.info(f"Sanitized string: '{text}' -> '{sanitized}'")
+            return sanitized
+            
+        except Exception as e:
+            logger.error(f"Error sanitizing string: {e}")
+            # Return a safe fallback
+            return text[:50] if text else ""  # Limit length and remove any problematic chars 

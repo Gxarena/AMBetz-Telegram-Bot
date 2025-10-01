@@ -236,9 +236,21 @@ async def stripe_webhook(request: Request):
             else:
                 logger.error("Failed to process payment data")
         
+        elif event.type == 'invoice.payment_succeeded':
+            logger.info("Processing invoice.payment_succeeded event (recurring payment)")
+            await handle_recurring_payment(event.data.object)
+        
+        elif event.type == 'customer.subscription.updated':
+            logger.info("Processing customer.subscription.updated event")
+            await handle_subscription_updated(event.data.object)
+        
+        elif event.type == 'customer.subscription.deleted':
+            logger.info("Processing customer.subscription.deleted event")
+            await handle_subscription_cancelled(event.data.object)
+        
         elif event.type == 'invoice.payment_failed':
             logger.info(f"Payment failed for session: {event.data.object.id}")
-            # Handle failed payment if needed
+            await handle_payment_failed(event.data.object)
         
         else:
             logger.info(f"Unhandled event type: {event.type}")
@@ -248,6 +260,200 @@ async def stripe_webhook(request: Request):
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+async def handle_recurring_payment(invoice):
+    """Handle successful recurring payment"""
+    try:
+        logger.info(f"Processing recurring payment for invoice: {invoice.id}")
+        
+        # Get subscription from invoice
+        subscription_id = invoice.subscription
+        if not subscription_id:
+            logger.error("No subscription ID in invoice")
+            return
+        
+        # Get subscription details from Stripe
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        customer_id = subscription.customer
+        
+        # Get customer details
+        customer = stripe.Customer.retrieve(customer_id)
+        telegram_id = customer.metadata.get('telegram_id')
+        
+        if not telegram_id:
+            logger.error(f"No telegram_id found in customer metadata: {customer_id}")
+            return
+        
+        # Calculate new subscription dates
+        from datetime import datetime, timedelta
+        current_period_start = datetime.fromtimestamp(subscription.current_period_start)
+        current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+        
+        # Update subscription in Firestore
+        success = firestore_service.upsert_subscription(
+            telegram_id=int(telegram_id),
+            start_date=current_period_start,
+            expiry_date=current_period_end,
+            subscription_type="premium",
+            stripe_customer_id=customer_id,
+            stripe_session_id=invoice.id,  # Use invoice ID as reference
+            amount_paid=invoice.amount_paid / 100,  # Convert from cents
+            currency=invoice.currency
+        )
+        
+        if success:
+            logger.info(f"Updated recurring subscription for user {telegram_id}")
+            
+            # Notify user about successful renewal
+            try:
+                bot_app = await get_bot_application()
+                await bot_app.bot.send_message(
+                    chat_id=int(telegram_id),
+                    text=f"✅ **Subscription Renewed Successfully!**\n\n"
+                         f"Your VIP subscription has been renewed and will remain active until:\n"
+                         f"**{current_period_end.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                         f"Thank you for your continued support! 🎉"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send renewal notification to user {telegram_id}: {e}")
+        else:
+            logger.error(f"Failed to update recurring subscription for user {telegram_id}")
+            
+    except Exception as e:
+        logger.error(f"Error handling recurring payment: {e}")
+
+async def handle_subscription_updated(subscription):
+    """Handle subscription updates (status changes, etc.)"""
+    try:
+        logger.info(f"Processing subscription update: {subscription.id}")
+        
+        # Get customer details
+        customer = stripe.Customer.retrieve(subscription.customer)
+        telegram_id = customer.metadata.get('telegram_id')
+        
+        if not telegram_id:
+            logger.error(f"No telegram_id found in customer metadata")
+            return
+        
+        # Check if subscription is still active
+        if subscription.status in ['active', 'trialing']:
+            # Subscription is active, update expiry date
+            current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+            
+            success = firestore_service.upsert_subscription(
+                telegram_id=int(telegram_id),
+                start_date=datetime.fromtimestamp(subscription.current_period_start),
+                expiry_date=current_period_end,
+                subscription_type="premium",
+                stripe_customer_id=subscription.customer,
+                stripe_session_id=subscription.id
+            )
+            
+            if success:
+                logger.info(f"Updated subscription status for user {telegram_id}")
+        else:
+            # Subscription is not active, mark as expired
+            success = firestore_service.mark_subscription_expired(int(telegram_id))
+            if success:
+                logger.info(f"Marked subscription as expired for user {telegram_id}")
+                
+                # Notify user about subscription status change
+                try:
+                    bot_app = await get_bot_application()
+                    await bot_app.bot.send_message(
+                        chat_id=int(telegram_id),
+                        text=f"⚠️ **Subscription Status Changed**\n\n"
+                             f"Your subscription status has been updated to: **{subscription.status}**\n\n"
+                             f"Please check your subscription status with /status"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send status update notification: {e}")
+                    
+    except Exception as e:
+        logger.error(f"Error handling subscription update: {e}")
+
+async def handle_subscription_cancelled(subscription):
+    """Handle subscription cancellation"""
+    try:
+        logger.info(f"Processing subscription cancellation: {subscription.id}")
+        
+        # Get customer details
+        customer = stripe.Customer.retrieve(subscription.customer)
+        telegram_id = customer.metadata.get('telegram_id')
+        
+        if not telegram_id:
+            logger.error(f"No telegram_id found in customer metadata")
+            return
+        
+        # Calculate when subscription actually expires (end of current period)
+        from datetime import datetime
+        current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+        
+        # Update subscription with cancellation info but keep it active until period end
+        success = firestore_service.upsert_subscription(
+            telegram_id=int(telegram_id),
+            start_date=datetime.fromtimestamp(subscription.current_period_start),
+            expiry_date=current_period_end,
+            subscription_type="premium",
+            stripe_customer_id=subscription.customer,
+            stripe_session_id=subscription.id,
+            metadata={"cancelled": True, "cancelled_at": datetime.utcnow().isoformat()}
+        )
+        
+        if success:
+            logger.info(f"Updated cancelled subscription for user {telegram_id} - expires at {current_period_end}")
+            
+            # Notify user about cancellation
+            try:
+                bot_app = await get_bot_application()
+                await bot_app.bot.send_message(
+                    chat_id=int(telegram_id),
+                    text=f"❌ **Subscription Cancelled**\n\n"
+                         f"Your subscription has been cancelled and will expire on:\n"
+                         f"**{current_period_end.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                         f"You will continue to have VIP access until then.\n\n"
+                         f"Use /start to resubscribe when you're ready to return!"
+                )
+            except Exception as e:
+                logger.error(f"Failed to send cancellation notification: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error handling subscription cancellation: {e}")
+
+async def handle_payment_failed(invoice):
+    """Handle failed payment"""
+    try:
+        logger.info(f"Processing failed payment for invoice: {invoice.id}")
+        
+        # Get subscription from invoice
+        subscription_id = invoice.subscription
+        if not subscription_id:
+            logger.error("No subscription ID in invoice")
+            return
+        
+        # Get subscription details
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        customer = stripe.Customer.retrieve(subscription.customer)
+        telegram_id = customer.metadata.get('telegram_id')
+        
+        if not telegram_id:
+            logger.error(f"No telegram_id found in customer metadata")
+            return
+        
+        # Notify user about failed payment
+        try:
+            bot_app = await get_bot_application()
+            await bot_app.bot.send_message(
+                chat_id=int(telegram_id),
+                text=f"⚠️ **Payment Failed**\n\n"
+                     f"Your subscription payment could not be processed. Please update your payment method to avoid service interruption.\n\n"
+                     f"Use /status to check your subscription status."
+            )
+        except Exception as e:
+            logger.error(f"Failed to send payment failure notification: {e}")
+            
+    except Exception as e:
+        logger.error(f"Error handling payment failure: {e}")
 
 @app.post("/check-expired")
 async def check_expired_subscriptions():

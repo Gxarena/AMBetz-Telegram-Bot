@@ -263,6 +263,7 @@ class GCPTelegramBot:
 *Available Commands:*
 /start - Welcome message and subscription options
 /status - Check your current subscription status
+/cancel - Cancel your subscription (keeps access until period end)
 /help - Show this help message
 
 *How to Subscribe:*
@@ -270,6 +271,11 @@ class GCPTelegramBot:
 2. Click "Subscribe" to begin payment process
 3. Complete payment securely through Stripe
 4. Receive exclusive one-time invite links for VIP groups!
+
+*Subscription Management:*
+• **Monthly recurring billing** - Automatic renewal
+• **Cancel anytime** - Use /cancel command
+• **Access until period end** - No immediate cutoff
 
 *VIP Groups:*
 • **Announcements Channel**: Daily picks and betting tips (one-time invite link)
@@ -365,6 +371,149 @@ Contact AM if you have any questions about your subscription.
             logger.error(f"Error expiring subscription: {e}")
             await update.message.reply_text(f"Failed to expire subscription: {e}")
 
+    async def expired_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Check for expired subscriptions (admin command)."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /expired command in group chat {update.effective_chat.id}")
+            return
+        
+        try:
+            # Find expired subscriptions
+            expired_subscriptions = self.firestore_service.find_expired_subscriptions()
+            
+            if not expired_subscriptions:
+                await update.message.reply_text("✅ No expired subscriptions found.")
+                return
+            
+            # Format the response
+            message = f"📋 **Found {len(expired_subscriptions)} expired subscriptions:**\n\n"
+            
+            for i, sub in enumerate(expired_subscriptions, 1):
+                user_id = sub.get('telegram_id', 'Unknown')
+                expiry_date = sub.get('expiry_date', 'Unknown')
+                status = sub.get('status', 'Unknown')
+                
+                # Format expiry date
+                if hasattr(expiry_date, 'strftime'):
+                    expiry_str = expiry_date.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    expiry_str = str(expiry_date)
+                
+                message += f"{i}. **User ID:** `{user_id}`\n"
+                message += f"   **Status:** {status}\n"
+                message += f"   **Expired:** {expiry_str}\n\n"
+            
+            await update.message.reply_text(message, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Error in expired_command: {e}")
+            await update.message.reply_text(f"❌ Error checking expired subscriptions: {e}")
+
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Cancel user's subscription."""
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /cancel command in group chat {update.effective_chat.id}")
+            return
+        
+        user_id = update.effective_user.id
+        
+        try:
+            # Check if user has an active subscription
+            subscription = self.firestore_service.get_subscription(user_id)
+            
+            if not subscription or subscription.get('status') != 'active':
+                await update.message.reply_text(
+                    "❌ **No Active Subscription Found**\n\n"
+                    "You don't have an active subscription to cancel.\n\n"
+                    "Use /start to subscribe if you'd like to join VIP!"
+                )
+                return
+            
+            # Check if subscription is already cancelled
+            metadata = subscription.get('metadata', {})
+            if metadata.get('cancelled'):
+                expiry_date = subscription.get('expiry_date')
+                await update.message.reply_text(
+                    f"⚠️ **Subscription Already Cancelled**\n\n"
+                    f"Your subscription has already been cancelled and will expire on:\n"
+                    f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                    f"You will continue to have VIP access until then."
+                )
+                return
+            
+            # Get Stripe customer ID
+            stripe_customer_id = subscription.get('stripe_customer_id')
+            if not stripe_customer_id:
+                await update.message.reply_text(
+                    "❌ **Unable to Cancel Subscription**\n\n"
+                    "We couldn't find your Stripe customer information. Please contact support for assistance."
+                )
+                return
+            
+            # Cancel the subscription in Stripe
+            try:
+                import stripe
+                stripe.api_key = self.stripe_service.secret_key
+                
+                # Get active subscriptions for this customer
+                subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='active')
+                
+                if not subscriptions.data:
+                    await update.message.reply_text(
+                        "❌ **No Active Stripe Subscription Found**\n\n"
+                        "We couldn't find an active subscription in Stripe. Please contact support."
+                    )
+                    return
+                
+                # Cancel the subscription
+                stripe_subscription = subscriptions.data[0]
+                stripe.Subscription.modify(
+                    stripe_subscription.id,
+                    cancel_at_period_end=True
+                )
+                
+                # Update Firestore to mark as cancelled
+                expiry_date = subscription.get('expiry_date')
+                success = self.firestore_service.upsert_subscription(
+                    telegram_id=user_id,
+                    start_date=subscription.get('start_date'),
+                    expiry_date=expiry_date,
+                    subscription_type=subscription.get('subscription_type', 'premium'),
+                    stripe_customer_id=stripe_customer_id,
+                    stripe_session_id=subscription.get('stripe_session_id'),
+                    amount_paid=subscription.get('amount_paid'),
+                    currency=subscription.get('currency'),
+                    metadata={"cancelled": True, "cancelled_at": datetime.utcnow().isoformat()}
+                )
+                
+                if success:
+                    await update.message.reply_text(
+                        f"✅ **Subscription Cancelled Successfully**\n\n"
+                        f"Your subscription has been cancelled and will expire on:\n"
+                        f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                        f"You will continue to have VIP access until then.\n\n"
+                        f"Use /start to resubscribe when you're ready to return!"
+                    )
+                    logger.info(f"User {user_id} cancelled their subscription")
+                else:
+                    await update.message.reply_text(
+                        "❌ **Error Cancelling Subscription**\n\n"
+                        "There was an error updating your subscription status. Please contact support."
+                    )
+                
+            except Exception as e:
+                logger.error(f"Error cancelling Stripe subscription for user {user_id}: {e}")
+                await update.message.reply_text(
+                    "❌ **Error Cancelling Subscription**\n\n"
+                    "There was an error cancelling your subscription. Please contact support for assistance."
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in cancel_command: {e}")
+            await update.message.reply_text(f"❌ Error processing cancellation request: {e}")
+
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button callbacks."""
         # Only respond in private chats
@@ -397,8 +546,8 @@ Contact AM if you have any questions about your subscription.
                     user_id = update.effective_user.id
                     username = update.effective_user.username
                     
-                    # Create payment link
-                    payment_url = self.stripe_service.create_payment_link(user_id, username)
+                    # Create subscription checkout (recurring billing)
+                    payment_url = self.stripe_service.create_subscription_checkout(user_id, username)
                     
                     # Send payment link to user
                     keyboard = [
@@ -411,7 +560,8 @@ Contact AM if you have any questions about your subscription.
                         "Click the button below to complete your payment securely through Stripe.\n\n"
                         "✅ Secure payment processing\n"
                         "✅ Instant activation\n"
-                        "✅ 30-day subscription",
+                        "✅ Monthly recurring subscription\n"
+                        "✅ Auto-renewal (cancel anytime)",
                         reply_markup=reply_markup
                     )
                     
@@ -663,6 +813,7 @@ Contact AM if you have any questions about your subscription.
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("cancel", self.cancel_command))
         self.application.add_handler(CommandHandler("chatinfo", self.get_chat_info))
         
         # Add development commands only if in development mode
@@ -670,9 +821,11 @@ Contact AM if you have any questions about your subscription.
         if is_development:
             self.application.add_handler(CommandHandler("test", self.test_command))
             self.application.add_handler(CommandHandler("expire", self.expire_command))
-            logger.info("Development commands (/test, /expire) enabled")
+            self.application.add_handler(CommandHandler("expired", self.expired_command))
+            logger.info("Development commands (/test, /expire, /expired) enabled")
         else:
-            logger.info("Production mode: Development commands disabled")
+            self.application.add_handler(CommandHandler("expired", self.expired_command))
+            logger.info("Production mode: Development commands disabled, /expired enabled")
         
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
         self.application.add_handler(MessageHandler(filters.ALL, self.handle_message))
