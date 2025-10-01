@@ -82,6 +82,10 @@ class GCPTelegramBot:
     def _get_secret(self, secret_name: str) -> str:
         """Get secret from GCP Secret Manager"""
         try:
+            # Check if we're in test mode and use test secrets
+            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                secret_name = f"{secret_name}-test"
+            
             client = secretmanager.SecretManagerServiceClient()
             name = f"projects/{self.project_id}/secrets/{secret_name}/versions/latest"
             response = client.access_secret_version(request={"name": name})
