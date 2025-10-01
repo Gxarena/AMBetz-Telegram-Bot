@@ -36,6 +36,10 @@ class GCPStripeService:
     def _get_secret(self, secret_name: str) -> str:
         """Get secret from GCP Secret Manager"""
         try:
+            # Check if we're in test mode and use test secrets
+            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                secret_name = f"{secret_name}-test"
+            
             # Build the resource name of the secret version
             name = f"projects/{self.project_id}/secrets/{secret_name}/versions/latest"
             
