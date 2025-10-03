@@ -34,8 +34,8 @@ steps:
 
 substitutions:
   _REGION: 'us-central1'  # Change to your preferred region
-  _DEVELOPMENT_MODE: 'true'  # Default to true (will be overridden by trigger)
-  _SERVICE_NAME: 'telegram-bot-test'  # Default to test service (will be overridden by trigger)
+  _DEVELOPMENT_MODE: 'false'  # Default to true (will be overridden by trigger)
+  _SERVICE_NAME: 'telegram-bot'  # Default to test service (will be overridden by trigger)
 
 options:
   logging: CLOUD_LOGGING_ONLY 

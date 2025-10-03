@@ -297,6 +297,7 @@ async def handle_recurring_payment(invoice):
             subscription_type="premium",
             stripe_customer_id=customer_id,
             stripe_session_id=invoice.id,  # Use invoice ID as reference
+            stripe_subscription_id=subscription_id,  # Add subscription ID for tracking
             amount_paid=invoice.amount_paid / 100,  # Convert from cents
             currency=invoice.currency
         )
@@ -346,7 +347,8 @@ async def handle_subscription_updated(subscription):
                 expiry_date=current_period_end,
                 subscription_type="premium",
                 stripe_customer_id=subscription.customer,
-                stripe_session_id=subscription.id
+                stripe_session_id=subscription.id,
+                stripe_subscription_id=subscription.id
             )
             
             if success:

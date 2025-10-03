@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
@@ -53,6 +53,7 @@ class FirestoreService:
                            metadata: Dict[str, Any] = None,
                            stripe_customer_id: str = None,
                            stripe_session_id: str = None,
+                           stripe_subscription_id: str = None,
                            amount_paid: float = None,
                            currency: str = None) -> bool:
         """
@@ -66,6 +67,7 @@ class FirestoreService:
             metadata: Additional metadata about the subscription
             stripe_customer_id: Stripe customer ID (optional)
             stripe_session_id: Stripe session ID (optional)
+            stripe_subscription_id: Stripe subscription ID for recurring subscriptions (optional)
             amount_paid: Amount paid in dollars (optional)
             currency: Payment currency (optional)
             
@@ -88,6 +90,8 @@ class FirestoreService:
                 subscription_data['stripe_customer_id'] = stripe_customer_id
             if stripe_session_id:
                 subscription_data['stripe_session_id'] = stripe_session_id
+            if stripe_subscription_id:
+                subscription_data['stripe_subscription_id'] = stripe_subscription_id
             if amount_paid is not None:
                 subscription_data['amount_paid'] = amount_paid
             if currency:
@@ -97,8 +101,10 @@ class FirestoreService:
             if metadata:
                 subscription_data['metadata'] = metadata
                 
-            doc_ref.set(subscription_data, merge=True)
-            logger.info(f"Subscription upserted for user {telegram_id}")
+            # Use merge=False to completely overwrite old subscriptions
+            # This prevents issues where old expired subscription data lingers
+            doc_ref.set(subscription_data, merge=False)
+            logger.info(f"Subscription upserted for user {telegram_id} (overwrote any old subscription)")
             return True
         except Exception as e:
             logger.error(f"Error in upsert_subscription for user {telegram_id}: {e}")
@@ -144,6 +150,26 @@ class FirestoreService:
             for doc in query.stream():
                 sub_data = doc.to_dict()
                 sub_data['telegram_id'] = int(doc.id)  # Ensure telegram_id is available
+                
+                # Skip subscriptions that are marked as cancelled but still have time remaining
+                # This prevents race conditions where renewal happens just before expiry check
+                metadata = sub_data.get('metadata', {})
+                if metadata.get('cancelled') == True:
+                    logger.info(f"Skipping expired cancelled subscription for user {sub_data['telegram_id']} - will expire naturally")
+                    continue
+                
+                # CRITICAL: If subscription has a stripe_subscription_id (recurring), add a grace period
+                # This prevents race conditions where Stripe renewal webhook fires just before expiry check
+                # Give 5 minutes grace period for Firestore to update from webhook
+                if sub_data.get('stripe_subscription_id'):
+                    grace_period_minutes = 5
+                    expiry_with_grace = sub_data['expiry_date'] + timedelta(minutes=grace_period_minutes)
+                    if current_time < expiry_with_grace:
+                        logger.info(f"Skipping user {sub_data['telegram_id']} - has recurring subscription and within {grace_period_minutes}min grace period")
+                        continue
+                    else:
+                        logger.warning(f"User {sub_data['telegram_id']} has recurring subscription but expired even with grace period - may need manual check")
+                
                 expired.append(sub_data)
             
             logger.info(f"Found {len(expired)} expired subscriptions")
