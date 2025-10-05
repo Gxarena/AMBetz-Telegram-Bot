@@ -8,7 +8,7 @@ from firestore_service import FirestoreService
 from gcp_stripe_service import GCPStripeService
 from gcp_bot import GCPTelegramBot
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -321,7 +321,7 @@ async def handle_recurring_payment(invoice):
             logger.error(f"Failed to update recurring subscription for user {telegram_id}")
             
     except Exception as e:
-        logger.error(f"Error handling recurring payment: {e}")
+        logger.error(f"Error handling recurring payment: {e}", exc_info=True)
 
 async def handle_subscription_updated(subscription):
     """Handle subscription updates (status changes, etc.)"""
@@ -372,7 +372,7 @@ async def handle_subscription_updated(subscription):
                     logger.error(f"Failed to send status update notification: {e}")
                     
     except Exception as e:
-        logger.error(f"Error handling subscription update: {e}")
+        logger.error(f"Error handling subscription update: {e}", exc_info=True)
 
 async def handle_subscription_cancelled(subscription):
     """Handle subscription cancellation"""
@@ -420,7 +420,7 @@ async def handle_subscription_cancelled(subscription):
                 logger.error(f"Failed to send cancellation notification: {e}")
                 
     except Exception as e:
-        logger.error(f"Error handling subscription cancellation: {e}")
+        logger.error(f"Error handling subscription cancellation: {e}", exc_info=True)
 
 async def handle_payment_failed(invoice):
     """Handle failed payment"""
@@ -455,7 +455,7 @@ async def handle_payment_failed(invoice):
             logger.error(f"Failed to send payment failure notification: {e}")
             
     except Exception as e:
-        logger.error(f"Error handling payment failure: {e}")
+        logger.error(f"Error handling payment failure: {e}", exc_info=True)
 
 @app.post("/check-expired")
 async def check_expired_subscriptions():
@@ -521,7 +521,11 @@ async def check_expired_subscriptions():
                         )
                         logger.info(f"Removed user {telegram_id} from VIP announcements group")
                     except Exception as e:
-                        logger.error(f"Failed to remove user {telegram_id} from VIP announcements group: {e}")
+                        # Regular groups don't support ban_chat_member, only supergroups
+                        if "supergroup and channel chats only" in str(e):
+                            logger.warning(f"VIP announcements group is a regular group, cannot auto-remove user {telegram_id}. Convert to supergroup for auto-kick.")
+                        else:
+                            logger.error(f"Failed to remove user {telegram_id} from VIP announcements group: {e}")
                 
                 # Try to remove from VIP discussion group
                 vip_discussion_id_str = firestore_service._get_secret("vip-chat-id") if hasattr(firestore_service, '_get_secret') else None
@@ -547,7 +551,11 @@ async def check_expired_subscriptions():
                         )
                         logger.info(f"Removed user {telegram_id} from VIP discussion group")
                     except Exception as e:
-                        logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
+                        # Regular groups don't support ban_chat_member, only supergroups
+                        if "supergroup and channel chats only" in str(e):
+                            logger.warning(f"VIP discussion group is a regular group, cannot auto-remove user {telegram_id}. Convert to supergroup for auto-kick.")
+                        else:
+                            logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
                 
                 # Send expiry notification to user
                 try:
