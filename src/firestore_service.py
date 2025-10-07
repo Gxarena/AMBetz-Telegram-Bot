@@ -1,5 +1,6 @@
 import os
 import logging
+import pytz
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from google.cloud import firestore
@@ -138,7 +139,8 @@ class FirestoreService:
             List[Dict]: List of expired subscriptions
         """
         try:
-            current_time = datetime.utcnow()
+            # Use timezone-aware datetime for Firestore query compatibility
+            current_time = datetime.now(pytz.UTC)
             
             # Find subscriptions where expiry_date is less than current time
             # and status is still "active"
@@ -150,13 +152,6 @@ class FirestoreService:
             for doc in query.stream():
                 sub_data = doc.to_dict()
                 sub_data['telegram_id'] = int(doc.id)  # Ensure telegram_id is available
-                
-                # Skip subscriptions that are marked as cancelled but still have time remaining
-                # This prevents race conditions where renewal happens just before expiry check
-                metadata = sub_data.get('metadata', {})
-                if metadata.get('cancelled') == True:
-                    logger.info(f"Skipping expired cancelled subscription for user {sub_data['telegram_id']} - will expire naturally")
-                    continue
                 
                 # CRITICAL: If subscription has a stripe_subscription_id (recurring), add a grace period
                 # This prevents race conditions where Stripe renewal webhook fires just before expiry check

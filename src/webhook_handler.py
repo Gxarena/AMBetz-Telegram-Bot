@@ -267,9 +267,9 @@ async def handle_recurring_payment(invoice):
         logger.info(f"Processing recurring payment for invoice: {invoice.id}")
         
         # Get subscription from invoice
-        subscription_id = invoice.subscription
+        subscription_id = getattr(invoice, 'subscription', None)
         if not subscription_id:
-            logger.error("No subscription ID in invoice")
+            logger.warning(f"No subscription ID in invoice {invoice.id} - likely a one-time payment")
             return
         
         # Get subscription details from Stripe
@@ -287,6 +287,12 @@ async def handle_recurring_payment(invoice):
         # Calculate new subscription dates
         from datetime import datetime, timedelta
         current_period_start = datetime.fromtimestamp(subscription.current_period_start)
+        
+        # Check if current_period_end exists
+        if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
+            logger.warning(f"Subscription {subscription_id} has no current_period_end, skipping update")
+            return
+        
         current_period_end = datetime.fromtimestamp(subscription.current_period_end)
         
         # Update subscription in Firestore
@@ -339,6 +345,11 @@ async def handle_subscription_updated(subscription):
         # Check if subscription is still active
         if subscription.status in ['active', 'trialing']:
             # Subscription is active, update expiry date
+            # Check if current_period_end exists
+            if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
+                logger.warning(f"Subscription {subscription.id} has no current_period_end, skipping update")
+                return
+            
             current_period_end = datetime.fromtimestamp(subscription.current_period_end)
             
             success = firestore_service.upsert_subscription(
@@ -428,9 +439,9 @@ async def handle_payment_failed(invoice):
         logger.info(f"Processing failed payment for invoice: {invoice.id}")
         
         # Get subscription from invoice
-        subscription_id = invoice.subscription
+        subscription_id = getattr(invoice, 'subscription', None)
         if not subscription_id:
-            logger.error("No subscription ID in invoice")
+            logger.warning(f"No subscription ID in invoice {invoice.id} - likely a one-time payment")
             return
         
         # Get subscription details
