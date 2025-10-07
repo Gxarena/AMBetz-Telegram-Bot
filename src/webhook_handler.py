@@ -266,17 +266,13 @@ async def handle_recurring_payment(invoice):
     try:
         logger.info(f"Processing recurring payment for invoice: {invoice.id}")
         
-        # Get subscription from invoice
-        subscription_id = getattr(invoice, 'subscription', None)
-        if not subscription_id:
-            logger.warning(f"No subscription ID in invoice {invoice.id} - likely a one-time payment")
+        # Get customer ID from invoice
+        customer_id = getattr(invoice, 'customer', None)
+        if not customer_id:
+            logger.warning(f"No customer ID in invoice {invoice.id}")
             return
         
-        # Get subscription details from Stripe
-        subscription = stripe.Subscription.retrieve(subscription_id)
-        customer_id = subscription.customer
-        
-        # Get customer details
+        # Get customer details to get telegram_id
         customer = stripe.Customer.retrieve(customer_id)
         telegram_id = customer.metadata.get('telegram_id')
         
@@ -284,16 +280,59 @@ async def handle_recurring_payment(invoice):
             logger.error(f"No telegram_id found in customer metadata: {customer_id}")
             return
         
-        # Calculate new subscription dates
+        # Try to get subscription ID from invoice
+        subscription_id = getattr(invoice, 'subscription', None)
+        
+        # If no subscription ID at top level, try to extract from line items
+        if not subscription_id and hasattr(invoice, 'lines') and invoice.lines:
+            try:
+                # Try to get subscription from first line item's parent field
+                if hasattr(invoice.lines, 'data') and len(invoice.lines.data) > 0:
+                    first_line = invoice.lines.data[0]
+                    line_dict = dict(first_line)
+                    
+                    # Check parent -> subscription_item_details -> subscription
+                    if 'parent' in line_dict and isinstance(line_dict['parent'], dict):
+                        parent = line_dict['parent']
+                        if 'subscription_item_details' in parent and isinstance(parent['subscription_item_details'], dict):
+                            sub_id = parent['subscription_item_details'].get('subscription')
+                            if sub_id:
+                                subscription_id = sub_id
+                                logger.info(f"Found subscription ID in line item parent: {subscription_id}")
+            except Exception as e:
+                logger.warning(f"Could not extract subscription from line items: {e}")
+        
+        # Calculate subscription dates
         from datetime import datetime, timedelta
-        current_period_start = datetime.fromtimestamp(subscription.current_period_start)
         
-        # Check if current_period_end exists
-        if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
-            logger.warning(f"Subscription {subscription_id} has no current_period_end, skipping update")
-            return
-        
-        current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+        # If we have a subscription ID, use it to get accurate period dates
+        if subscription_id:
+            try:
+                subscription = stripe.Subscription.retrieve(subscription_id)
+                
+                # Check if current_period_end exists
+                if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
+                    logger.warning(f"Subscription {subscription_id} has no current_period_end, using invoice date + 30 days")
+                    # Fall back to invoice date + 30 days
+                    invoice_date = datetime.fromtimestamp(invoice.created)
+                    current_period_start = invoice_date
+                    current_period_end = invoice_date + timedelta(days=30)
+                else:
+                    current_period_start = datetime.fromtimestamp(subscription.current_period_start)
+                    current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+                    
+            except Exception as e:
+                logger.warning(f"Could not retrieve subscription {subscription_id}: {e}, using invoice date + 30 days")
+                invoice_date = datetime.fromtimestamp(invoice.created)
+                current_period_start = invoice_date
+                current_period_end = invoice_date + timedelta(days=30)
+        else:
+            # No subscription ID found - treat as one-time payment
+            logger.info(f"No subscription ID found for invoice {invoice.id} - treating as one-time 30-day payment")
+            invoice_date = datetime.fromtimestamp(invoice.created)
+            current_period_start = invoice_date
+            current_period_end = invoice_date + timedelta(days=30)
+            subscription_id = None  # Explicitly set to None
         
         # Update subscription in Firestore
         success = firestore_service.upsert_subscription(
@@ -303,13 +342,13 @@ async def handle_recurring_payment(invoice):
             subscription_type="premium",
             stripe_customer_id=customer_id,
             stripe_session_id=invoice.id,  # Use invoice ID as reference
-            stripe_subscription_id=subscription_id,  # Add subscription ID for tracking
+            stripe_subscription_id=subscription_id,  # May be None for one-time payments
             amount_paid=invoice.amount_paid / 100,  # Convert from cents
             currency=invoice.currency
         )
         
         if success:
-            logger.info(f"Updated recurring subscription for user {telegram_id}")
+            logger.info(f"Updated recurring subscription for user {telegram_id}, expiry: {current_period_end}")
             
             # Notify user about successful renewal
             try:
