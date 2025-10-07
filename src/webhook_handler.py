@@ -9,6 +9,7 @@ from gcp_stripe_service import GCPStripeService
 from gcp_bot import GCPTelegramBot
 import json
 from datetime import datetime, timedelta
+from google.cloud import secretmanager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -455,6 +456,22 @@ async def handle_subscription_cancelled(subscription):
         if success:
             logger.info(f"Updated cancelled subscription for user {telegram_id} - expires at {current_period_end}")
             
+            # Get user info for display name
+            user_info = firestore_service.get_user(int(telegram_id))
+            
+            # Determine display name (username preferred, otherwise first/last name)
+            if user_info and user_info.get('username'):
+                display_name = f"@{user_info['username']}"
+            elif user_info:
+                first_name = user_info.get('first_name', '')
+                last_name = user_info.get('last_name', '')
+                if first_name or last_name:
+                    display_name = f"{first_name} {last_name}".strip()
+                else:
+                    display_name = f"User {telegram_id}"
+            else:
+                display_name = f"User {telegram_id}"
+            
             # Notify user about cancellation
             try:
                 bot_app = await get_bot_application()
@@ -468,6 +485,34 @@ async def handle_subscription_cancelled(subscription):
                 )
             except Exception as e:
                 logger.error(f"Failed to send cancellation notification: {e}")
+            
+            # Notify admin about the cancellation
+            try:
+                secret_client = secretmanager.SecretManagerServiceClient()
+                project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+                
+                # Get admin telegram ID
+                try:
+                    secret_name = f"projects/{project_id}/secrets/admin-telegram-id/versions/latest"
+                    response = secret_client.access_secret_version(request={"name": secret_name})
+                    admin_id_str = response.payload.data.decode("UTF-8").strip()
+                    admin_id = int(admin_id_str)
+                    
+                    # Send admin notification
+                    bot_app = await get_bot_application()
+                    await bot_app.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"⚠️ **Subscription Cancelled**\n\n"
+                             f"User: {display_name}\n"
+                             f"Telegram ID: {telegram_id}\n"
+                             f"Expires: {current_period_end.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                             f"They will retain access until the expiry date."
+                    )
+                    logger.info(f"Sent cancellation notification to admin for user {display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to send admin notification about cancellation: {e}")
+            except Exception as e:
+                logger.error(f"Error setting up admin notification: {e}")
                 
     except Exception as e:
         logger.error(f"Error handling subscription cancellation: {e}", exc_info=True)
@@ -541,7 +586,19 @@ async def check_expired_subscriptions():
                 
                 # Get user info for notifications
                 user_info = firestore_service.get_user(telegram_id)
-                username = user_info.get("username") if user_info else None
+                
+                # Determine display name (username preferred, otherwise first/last name)
+                if user_info and user_info.get('username'):
+                    display_name = f"@{user_info['username']}"
+                elif user_info:
+                    first_name = user_info.get('first_name', '')
+                    last_name = user_info.get('last_name', '')
+                    if first_name or last_name:
+                        display_name = f"{first_name} {last_name}".strip()
+                    else:
+                        display_name = f"User {telegram_id}"
+                else:
+                    display_name = f"User {telegram_id}"
                 
                 # Try to remove from VIP announcements channel
                 vip_announcements_id_str = firestore_service._get_secret("vip-announcements-id") if hasattr(firestore_service, '_get_secret') else None
@@ -630,13 +687,16 @@ async def check_expired_subscriptions():
                         admin_id = int(admin_id_str)
                         await bot_app.bot.send_message(
                             chat_id=admin_id,
-                            text=f"🚫 User {username or telegram_id} has been removed from VIP groups due to subscription expiry."
+                            text=f"🚫 **User Removed from VIP Groups**\n\n"
+                                 f"User: {display_name}\n"
+                                 f"Telegram ID: {telegram_id}\n"
+                                 f"Reason: Subscription expired"
                         )
                     except Exception as e:
                         logger.error(f"Failed to send admin notification: {e}")
                 
                 kicked_count += 1
-                logger.info(f"Successfully processed expired subscription for user {telegram_id}")
+                logger.info(f"Successfully processed expired subscription for user {display_name} ({telegram_id})")
                 
             except Exception as e:
                 logger.error(f"Error processing expired subscription for user {telegram_id}: {e}")
