@@ -62,16 +62,28 @@ class GCPTelegramBot:
             self.vip_announcements_id = int(vip_chat_id_str)
             logger.info(f"Using vip-chat-id for both announcements and discussion: {self.vip_announcements_id}")
         
-        # Get admin Telegram ID for notifications (optional)
-        admin_id_str = self._get_secret("admin-telegram-id")
-        self.admin_telegram_id = int(admin_id_str) if admin_id_str else None
+        # Get admin Telegram IDs for notifications (optional)
+        admin_ids_str = self._get_secret("admin-telegram-id")
+        if admin_ids_str:
+            # Parse comma-separated admin IDs
+            try:
+                self.admin_telegram_ids = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
+                # For backward compatibility, keep the first admin ID as admin_telegram_id
+                self.admin_telegram_id = self.admin_telegram_ids[0] if self.admin_telegram_ids else None
+            except ValueError as e:
+                logger.error(f"Error parsing admin IDs '{admin_ids_str}': {e}")
+                self.admin_telegram_ids = []
+                self.admin_telegram_id = None
+        else:
+            self.admin_telegram_ids = []
+            self.admin_telegram_id = None
         
         if self.vip_announcements_id:
             logger.info(f"VIP announcements chat ID configured: {self.vip_announcements_id}")
         if self.vip_discussion_id:
             logger.info(f"VIP discussion chat ID configured: {self.vip_discussion_id}")
-        if self.admin_telegram_id:
-            logger.info(f"Admin Telegram ID configured: {self.admin_telegram_id}")
+        if self.admin_telegram_ids:
+            logger.info(f"Admin Telegram IDs configured: {self.admin_telegram_ids}")
         
         if not self.vip_announcements_id and not self.vip_discussion_id:
             logger.warning("No VIP chat IDs configured. Group management features will be disabled.")
@@ -227,9 +239,9 @@ class GCPTelegramBot:
         return success
 
     async def notify_admin_user_kicked(self, user_id: int, username: str = None, reason: str = "subscription expired") -> None:
-        """Send notification to admin when a user is kicked from VIP group"""
-        if not self.admin_telegram_id:
-            logger.warning("No admin Telegram ID configured. Skipping admin notification.")
+        """Send notification to all admins when a user is kicked from VIP group"""
+        if not self.admin_telegram_ids:
+            logger.warning("No admin Telegram IDs configured. Skipping admin notification.")
             return
         
         try:
@@ -243,13 +255,19 @@ class GCPTelegramBot:
                 f"⚠️ **Action Required:** Please manually remove this user from the VIP channel as well."
             )
             
-            await self.application.bot.send_message(
-                chat_id=self.admin_telegram_id,
-                text=message,
-                parse_mode="Markdown"
-            )
+            # Send to all admins
+            for admin_id in self.admin_telegram_ids:
+                try:
+                    await self.application.bot.send_message(
+                        chat_id=admin_id,
+                        text=message,
+                        parse_mode="Markdown"
+                    )
+                    logger.info(f"Admin notification sent to {admin_id} for kicked user {user_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send notification to admin {admin_id}: {e}")
             
-            logger.info(f"Admin notification sent for kicked user {user_id}")
+            logger.info(f"Admin notifications sent for kicked user {user_id}")
             
         except Exception as e:
             logger.error(f"Failed to send admin notification for user {user_id}: {e}")

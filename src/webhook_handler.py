@@ -278,8 +278,17 @@ async def handle_recurring_payment(invoice):
         telegram_id = customer.metadata.get('telegram_id')
         
         if not telegram_id:
-            logger.error(f"No telegram_id found in customer metadata: {customer_id}")
-            return
+            logger.warning(f"No telegram_id found in customer metadata: {customer_id} (email: {customer.email})")
+            logger.info(f"Attempting to find telegram_id in Firestore subscriptions...")
+            
+            # Try to find telegram_id in Firestore by customer_id
+            subscription = firestore_service.get_subscription_by_stripe_customer(customer_id)
+            if subscription:
+                telegram_id = subscription['telegram_id']
+                logger.info(f"Found telegram_id in Firestore: {telegram_id}")
+            else:
+                logger.warning(f"No subscription found in Firestore for customer {customer_id}. Skipping webhook processing.")
+                return
         
         # Try to get subscription ID from invoice
         subscription_id = getattr(invoice, 'subscription', None)
@@ -379,8 +388,17 @@ async def handle_subscription_updated(subscription):
         telegram_id = customer.metadata.get('telegram_id')
         
         if not telegram_id:
-            logger.error(f"No telegram_id found in customer metadata")
-            return
+            logger.warning(f"No telegram_id found in customer metadata: {subscription.customer} (email: {customer.email})")
+            logger.info(f"Attempting to find telegram_id in Firestore subscriptions...")
+            
+            # Try to find telegram_id in Firestore by customer_id
+            subscription_data = firestore_service.get_subscription_by_stripe_customer(subscription.customer)
+            if subscription_data:
+                telegram_id = subscription_data['telegram_id']
+                logger.info(f"Found telegram_id in Firestore: {telegram_id}")
+            else:
+                logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
+                return
         
         # Check if subscription is still active
         if subscription.status in ['active', 'trialing']:
@@ -435,8 +453,17 @@ async def handle_subscription_cancelled(subscription):
         telegram_id = customer.metadata.get('telegram_id')
         
         if not telegram_id:
-            logger.error(f"No telegram_id found in customer metadata")
-            return
+            logger.warning(f"No telegram_id found in customer metadata: {subscription.customer} (email: {customer.email})")
+            logger.info(f"Attempting to find telegram_id in Firestore subscriptions...")
+            
+            # Try to find telegram_id in Firestore by customer_id
+            subscription_data = firestore_service.get_subscription_by_stripe_customer(subscription.customer)
+            if subscription_data:
+                telegram_id = subscription_data['telegram_id']
+                logger.info(f"Found telegram_id in Firestore: {telegram_id}")
+            else:
+                logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
+                return
         
         # Calculate when subscription actually expires (end of current period)
         from datetime import datetime
@@ -540,8 +567,17 @@ async def handle_payment_failed(invoice):
         telegram_id = customer.metadata.get('telegram_id')
         
         if not telegram_id:
-            logger.error(f"No telegram_id found in customer metadata")
-            return
+            logger.warning(f"No telegram_id found in customer metadata: {subscription.customer} (email: {customer.email})")
+            logger.info(f"Attempting to find telegram_id in Firestore subscriptions...")
+            
+            # Try to find telegram_id in Firestore by customer_id
+            subscription_data = firestore_service.get_subscription_by_stripe_customer(subscription.customer)
+            if subscription_data:
+                telegram_id = subscription_data['telegram_id']
+                logger.info(f"Found telegram_id in Firestore: {telegram_id}")
+            else:
+                logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
+                return
         
         # Notify user about failed payment
         try:

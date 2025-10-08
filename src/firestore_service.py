@@ -218,4 +218,29 @@ class FirestoreService:
             return None
         except Exception as e:
             logger.error(f"Error getting subscription by Stripe session {stripe_session_id}: {e}")
-            return None 
+            return None
+
+    def get_subscription_by_stripe_customer(self, stripe_customer_id: str) -> Optional[Dict]:
+        """
+        Get subscription by Stripe customer ID
+        
+        Args:
+            stripe_customer_id: Stripe customer ID
+            
+        Returns:
+            Optional[Dict]: Subscription data or None if not found
+        """
+        try:
+            query = (self.db.collection('subscriptions')
+                    .where(filter=FieldFilter('stripe_customer_id', '==', stripe_customer_id))
+                    .limit(1))
+            
+            docs = list(query.stream())
+            if docs:
+                sub_data = docs[0].to_dict()
+                sub_data['telegram_id'] = int(docs[0].id)
+                return sub_data
+            return None
+        except Exception as e:
+            logger.error(f"Error getting subscription by Stripe customer {stripe_customer_id}: {e}")
+            return None
