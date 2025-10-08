@@ -491,24 +491,30 @@ async def handle_subscription_cancelled(subscription):
                 secret_client = secretmanager.SecretManagerServiceClient()
                 project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
                 
-                # Get admin telegram ID
+                # Get admin telegram IDs
                 try:
                     secret_name = f"projects/{project_id}/secrets/admin-telegram-id/versions/latest"
                     response = secret_client.access_secret_version(request={"name": secret_name})
-                    admin_id_str = response.payload.data.decode("UTF-8").strip()
-                    admin_id = int(admin_id_str)
+                    admin_ids_str = response.payload.data.decode("UTF-8").strip()
                     
-                    # Send admin notification
+                    # Parse comma-separated admin IDs
+                    admin_ids = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
+                    
+                    # Send admin notification to all admins
                     bot_app = await get_bot_application()
-                    await bot_app.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"⚠️ **Subscription Cancelled**\n\n"
-                             f"User: {display_name}\n"
-                             f"Telegram ID: {telegram_id}\n"
-                             f"Expires: {current_period_end.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                             f"They will retain access until the expiry date."
-                    )
-                    logger.info(f"Sent cancellation notification to admin for user {display_name}")
+                    for admin_id in admin_ids:
+                        try:
+                            await bot_app.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"⚠️ **Subscription Cancelled**\n\n"
+                                     f"User: {display_name}\n"
+                                     f"Telegram ID: {telegram_id}\n"
+                                     f"Expires: {current_period_end.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                                     f"They will retain access until the expiry date."
+                            )
+                            logger.info(f"Sent cancellation notification to admin {admin_id} for user {display_name}")
+                        except Exception as e:
+                            logger.error(f"Failed to send cancellation notification to admin {admin_id}: {e}")
                 except Exception as e:
                     logger.error(f"Failed to send admin notification about cancellation: {e}")
             except Exception as e:
@@ -673,27 +679,30 @@ async def check_expired_subscriptions():
                 except Exception as e:
                     logger.error(f"Failed to send expiry notification to user {telegram_id}: {e}")
                 
-                # Send admin notification
-                admin_id_str = None
+                # Send admin notification to all admins
                 try:
                     secret_name = f"projects/{project_id}/secrets/admin-telegram-id/versions/latest"
                     response = client.access_secret_version(request={"name": secret_name})
-                    admin_id_str = response.payload.data.decode("UTF-8").strip()
-                except Exception:
-                    pass
-                
-                if admin_id_str:
-                    try:
-                        admin_id = int(admin_id_str)
-                        await bot_app.bot.send_message(
-                            chat_id=admin_id,
-                            text=f"🚫 **User Removed from VIP Groups**\n\n"
-                                 f"User: {display_name}\n"
-                                 f"Telegram ID: {telegram_id}\n"
-                                 f"Reason: Subscription expired"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to send admin notification: {e}")
+                    admin_ids_str = response.payload.data.decode("UTF-8").strip()
+                    
+                    # Parse comma-separated admin IDs
+                    admin_ids = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
+                    
+                    # Send notification to all admins
+                    for admin_id in admin_ids:
+                        try:
+                            await bot_app.bot.send_message(
+                                chat_id=admin_id,
+                                text=f"🚫 **User Removed from VIP Groups**\n\n"
+                                     f"User: {display_name}\n"
+                                     f"Telegram ID: {telegram_id}\n"
+                                     f"Reason: Subscription expired"
+                            )
+                            logger.info(f"Sent kick notification to admin {admin_id} for user {display_name}")
+                        except Exception as e:
+                            logger.error(f"Failed to send kick notification to admin {admin_id}: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to send admin notifications: {e}")
                 
                 kicked_count += 1
                 logger.info(f"Successfully processed expired subscription for user {display_name} ({telegram_id})")
