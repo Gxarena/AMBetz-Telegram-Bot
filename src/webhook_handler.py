@@ -551,7 +551,7 @@ async def handle_subscription_cancelled(subscription):
         logger.error(f"Error handling subscription cancellation: {e}", exc_info=True)
 
 async def handle_payment_failed(invoice):
-    """Handle failed payment"""
+    """Handle failed payment by canceling the subscription"""
     try:
         logger.info(f"Processing failed payment for invoice: {invoice.id}")
         
@@ -579,14 +579,30 @@ async def handle_payment_failed(invoice):
                 logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
                 return
         
-        # Notify user about failed payment
+        # Cancel the subscription due to payment failure
+        try:
+            logger.info(f"Canceling subscription {subscription_id} due to payment failure")
+            canceled_subscription = stripe.Subscription.cancel(subscription_id)
+            logger.info(f"Successfully canceled subscription {subscription_id}")
+        except Exception as e:
+            logger.error(f"Failed to cancel subscription {subscription_id}: {e}")
+            return
+        
+        # Mark subscription as expired in Firestore
+        try:
+            firestore_service.mark_subscription_expired(int(telegram_id))
+            logger.info(f"Marked subscription as expired for user {telegram_id}")
+        except Exception as e:
+            logger.error(f"Failed to mark subscription expired for user {telegram_id}: {e}")
+        
+        # Notify user about failed payment and cancellation
         try:
             bot_app = await get_bot_application()
             await bot_app.bot.send_message(
                 chat_id=int(telegram_id),
-                text=f"⚠️ **Payment Failed**\n\n"
-                     f"Your subscription payment could not be processed. Please update your payment method to avoid service interruption.\n\n"
-                     f"Use /status to check your subscription status."
+                text=f"❌ **Payment Failed - Subscription Cancelled**\n\n"
+                     f"Your subscription payment could not be processed and your subscription has been cancelled.\n\n"
+                     f"You can resubscribe anytime using /start to regain VIP access."
             )
         except Exception as e:
             logger.error(f"Failed to send payment failure notification: {e}")

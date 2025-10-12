@@ -135,6 +135,8 @@ class GCPStripeService:
             )
             
             if customers.data:
+                # Cancel any existing active subscriptions for this customer
+                self._cancel_existing_subscriptions(customers.data[0].id)
                 return customers.data[0]
             
             # Create new customer if not found
@@ -152,6 +154,22 @@ class GCPStripeService:
         except Exception as e:
             logger.error(f"Error handling customer: {e}")
             raise
+    
+    def _cancel_existing_subscriptions(self, customer_id: str):
+        """Cancel any existing active subscriptions for a customer"""
+        try:
+            # Get all active subscriptions for this customer
+            subscriptions = stripe.Subscription.list(customer=customer_id, status='active')
+            
+            for subscription in subscriptions.data:
+                try:
+                    stripe.Subscription.cancel(subscription.id)
+                    logger.info(f"Canceled existing subscription {subscription.id} for customer {customer_id}")
+                except Exception as e:
+                    logger.error(f"Failed to cancel subscription {subscription.id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error canceling existing subscriptions for customer {customer_id}: {e}")
     
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """Verify webhook signature from Stripe"""
