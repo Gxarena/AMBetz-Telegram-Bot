@@ -151,6 +151,11 @@ async def stripe_webhook(request: Request):
                 if existing_subscription and existing_subscription.get('status') == 'active':
                     logger.warning(f"User {subscription_data['telegram_id']} attempted to subscribe while already having active subscription")
                     
+                    # Check if this is a duplicate webhook for the same session
+                    if existing_subscription.get('stripe_session_id') == session_id:
+                        logger.info(f"Duplicate webhook for session {session_id}, skipping")
+                        return JSONResponse(content={"status": "success", "message": "duplicate_webhook"})
+                    
                     # Send message to user explaining they can't subscribe again
                     try:
                         bot_app = await get_bot_application()
@@ -243,7 +248,13 @@ async def stripe_webhook(request: Request):
         
         elif event.type == 'customer.subscription.updated':
             logger.info("Processing customer.subscription.updated event")
-            await handle_subscription_updated(event.data.object)
+            # Only process subscription updates if the subscription was created via webhook
+            # This prevents duplicate processing of the same subscription
+            subscription = event.data.object
+            if subscription.status in ['active', 'trialing']:
+                await handle_subscription_updated(subscription)
+            else:
+                logger.info(f"Skipping subscription update for status: {subscription.status}")
         
         elif event.type == 'customer.subscription.deleted':
             logger.info("Processing customer.subscription.deleted event")
@@ -400,6 +411,13 @@ async def handle_subscription_updated(subscription):
                 logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
                 return
         
+        # Check if this is a new subscription that was just created
+        # If so, we should let the checkout.session.completed handler deal with it
+        existing_subscription = firestore_service.get_subscription(int(telegram_id))
+        if not existing_subscription:
+            logger.info(f"No existing subscription found for user {telegram_id}, this might be a new subscription. Skipping update.")
+            return
+        
         # Check if subscription is still active
         if subscription.status in ['active', 'trialing']:
             # Subscription is active, update expiry date
@@ -410,18 +428,22 @@ async def handle_subscription_updated(subscription):
             
             current_period_end = datetime.fromtimestamp(subscription.current_period_end)
             
-            success = firestore_service.upsert_subscription(
-                telegram_id=int(telegram_id),
-                start_date=datetime.fromtimestamp(subscription.current_period_start),
-                expiry_date=current_period_end,
-                subscription_type="premium",
-                stripe_customer_id=subscription.customer,
-                stripe_session_id=subscription.id,
-                stripe_subscription_id=subscription.id
-            )
-            
-            if success:
-                logger.info(f"Updated subscription status for user {telegram_id}")
+            # Only update if the expiry date has actually changed
+            if existing_subscription.get('expiry_date') != current_period_end:
+                success = firestore_service.upsert_subscription(
+                    telegram_id=int(telegram_id),
+                    start_date=datetime.fromtimestamp(subscription.current_period_start),
+                    expiry_date=current_period_end,
+                    subscription_type="premium",
+                    stripe_customer_id=subscription.customer,
+                    stripe_session_id=subscription.id,
+                    stripe_subscription_id=subscription.id
+                )
+                
+                if success:
+                    logger.info(f"Updated subscription status for user {telegram_id}")
+            else:
+                logger.info(f"Subscription expiry date unchanged for user {telegram_id}, skipping update")
         else:
             # Subscription is not active, mark as expired
             success = firestore_service.mark_subscription_expired(int(telegram_id))
@@ -595,17 +617,126 @@ async def handle_payment_failed(invoice):
         except Exception as e:
             logger.error(f"Failed to mark subscription expired for user {telegram_id}: {e}")
         
-        # Notify user about failed payment and cancellation
+        # Get bot application for kicking and notifications
         try:
             bot_app = await get_bot_application()
+        except Exception as e:
+            logger.error(f"Failed to get bot application: {e}")
+            return
+        
+        # KICK USER FROM VIP GROUPS
+        # Get user info for display name
+        user_info = firestore_service.get_user(int(telegram_id))
+        if user_info and user_info.get('username'):
+            display_name = f"@{user_info['username']}"
+        elif user_info:
+            first_name = user_info.get('first_name', '')
+            last_name = user_info.get('last_name', '')
+            if first_name or last_name:
+                display_name = f"{first_name} {last_name}".strip()
+            else:
+                display_name = f"User {telegram_id}"
+        else:
+            display_name = f"User {telegram_id}"
+        
+        # Try to remove from VIP announcements channel
+        vip_announcements_id_str = None
+        vip_discussion_id_str = None
+        
+        from google.cloud import secretmanager
+        client = secretmanager.SecretManagerServiceClient()
+        project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+        
+        try:
+            secret_name = f"projects/{project_id}/secrets/vip-announcements-id/versions/latest"
+            response = client.access_secret_version(request={"name": secret_name})
+            vip_announcements_id_str = response.payload.data.decode("UTF-8").strip()
+        except Exception:
+            vip_announcements_id_str = None
+        
+        if vip_announcements_id_str:
+            try:
+                vip_announcements_id = int(vip_announcements_id_str)
+                await bot_app.bot.ban_chat_member(
+                    chat_id=vip_announcements_id,
+                    user_id=int(telegram_id)
+                )
+                # Unban immediately (this removes from group but allows rejoining later)
+                await bot_app.bot.unban_chat_member(
+                    chat_id=vip_announcements_id,
+                    user_id=int(telegram_id)
+                )
+                logger.info(f"Removed user {telegram_id} from VIP announcements group (payment failed)")
+            except Exception as e:
+                if "supergroup and channel chats only" in str(e):
+                    logger.warning(f"VIP announcements group is a regular group, cannot auto-remove user {telegram_id}.")
+                else:
+                    logger.error(f"Failed to remove user {telegram_id} from VIP announcements group: {e}")
+        
+        # Try to remove from VIP discussion group
+        try:
+            secret_name = f"projects/{project_id}/secrets/vip-chat-id/versions/latest"
+            response = client.access_secret_version(request={"name": secret_name})
+            vip_discussion_id_str = response.payload.data.decode("UTF-8").strip()
+        except Exception:
+            vip_discussion_id_str = None
+        
+        if vip_discussion_id_str:
+            try:
+                vip_discussion_id = int(vip_discussion_id_str)
+                await bot_app.bot.ban_chat_member(
+                    chat_id=vip_discussion_id,
+                    user_id=int(telegram_id)
+                )
+                # Unban immediately (this removes from group but allows rejoining later)
+                await bot_app.bot.unban_chat_member(
+                    chat_id=vip_discussion_id,
+                    user_id=int(telegram_id)
+                )
+                logger.info(f"Removed user {telegram_id} from VIP discussion group (payment failed)")
+            except Exception as e:
+                if "supergroup and channel chats only" in str(e):
+                    logger.warning(f"VIP discussion group is a regular group, cannot auto-remove user {telegram_id}.")
+                else:
+                    logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
+        
+        # Notify user about failed payment and cancellation
+        try:
             await bot_app.bot.send_message(
                 chat_id=int(telegram_id),
                 text=f"❌ **Payment Failed - Subscription Cancelled**\n\n"
                      f"Your subscription payment could not be processed and your subscription has been cancelled.\n\n"
+                     f"You have been removed from the VIP groups.\n\n"
                      f"You can resubscribe anytime using /start to regain VIP access."
             )
         except Exception as e:
             logger.error(f"Failed to send payment failure notification: {e}")
+        
+        # Notify admins about payment failure and removal
+        try:
+            secret_name = f"projects/{project_id}/secrets/admin-telegram-id/versions/latest"
+            response = client.access_secret_version(request={"name": secret_name})
+            admin_ids_str = response.payload.data.decode("UTF-8").strip()
+            
+            # Parse comma-separated admin IDs
+            admin_ids = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
+            
+            # Send notification to all admins
+            for admin_id in admin_ids:
+                try:
+                    await bot_app.bot.send_message(
+                        chat_id=admin_id,
+                        text=f"⚠️ **Payment Failed - User Removed**\n\n"
+                             f"User: {display_name}\n"
+                             f"Telegram ID: {telegram_id}\n"
+                             f"Reason: Payment failed, subscription cancelled\n\n"
+                             f"User has been removed from VIP groups."
+                    )
+                    logger.info(f"Sent payment failure notification to admin {admin_id} for user {display_name}")
+                except Exception as e:
+                    logger.error(f"Failed to send payment failure notification to admin {admin_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send admin notifications about payment failure: {e}")
             
     except Exception as e:
         logger.error(f"Error handling payment failure: {e}", exc_info=True)
