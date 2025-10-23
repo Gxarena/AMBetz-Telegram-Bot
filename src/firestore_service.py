@@ -244,3 +244,28 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Error getting subscription by Stripe customer {stripe_customer_id}: {e}")
             return None
+
+    def get_user_by_email(self, email: str) -> Optional[Dict]:
+        """
+        Get user by email address
+        
+        Args:
+            email: User's email address
+            
+        Returns:
+            Optional[Dict]: User data or None if not found
+        """
+        try:
+            query = (self.db.collection('users')
+                    .where(filter=FieldFilter('email', '==', email))
+                    .limit(1))
+            
+            docs = list(query.stream())
+            if docs:
+                user_data = docs[0].to_dict()
+                user_data['telegram_id'] = int(docs[0].id)
+                return user_data
+            return None
+        except Exception as e:
+            logger.error(f"Error getting user by email {email}: {e}")
+            return None

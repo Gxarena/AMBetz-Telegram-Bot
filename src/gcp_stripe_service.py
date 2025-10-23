@@ -188,10 +188,12 @@ class GCPStripeService:
             logger.info(f"Session data type: {type(session_data)}")
             logger.info(f"Session data attributes: {dir(session_data)}")
             
+            # Try multiple ways to get metadata
+            metadata = None
             if hasattr(session_data, 'metadata'):
                 metadata = session_data.metadata
                 logger.info(f"Metadata from attribute: {metadata}")
-            else:
+            elif hasattr(session_data, 'get'):
                 metadata = session_data.get("metadata", {})
                 logger.info(f"Metadata from get(): {metadata}")
             
@@ -199,6 +201,7 @@ class GCPStripeService:
             logger.info(f"Metadata type: {type(metadata)}")
             logger.info(f"Metadata content: {metadata}")
             
+            telegram_id = None
             try:
                 if isinstance(metadata, dict):
                     telegram_id = metadata.get("telegram_id")
@@ -210,7 +213,7 @@ class GCPStripeService:
                     telegram_id = getattr(metadata, 'telegram_id', None)
                     logger.info(f"Telegram ID from getattr(): {telegram_id}")
                 else:
-                    logger.error(f"Metadata is neither dict nor object with get/telegram_id: {type(metadata)}")
+                    logger.warning(f"Metadata is neither dict nor object with get/telegram_id: {type(metadata)}")
                     telegram_id = None
             except Exception as e:
                 logger.error(f"Error accessing telegram_id from metadata: {e}")
@@ -218,9 +221,68 @@ class GCPStripeService:
                 logger.error(f"Metadata content: {metadata}")
                 telegram_id = None
             
+            # FALLBACK: If no telegram_id in session metadata, try to get it from the customer
             if not telegram_id:
-                logger.error("No telegram_id in payment metadata")
-                logger.error(f"Metadata: {metadata}")
+                logger.warning("No telegram_id in session metadata, attempting fallback methods...")
+                
+                # Get customer ID from session
+                customer_id = None
+                if hasattr(session_data, 'customer'):
+                    customer_id = session_data.customer
+                elif hasattr(session_data, 'get'):
+                    customer_id = session_data.get("customer")
+                
+                if customer_id:
+                    try:
+                        # Retrieve customer from Stripe to get metadata
+                        customer = stripe.Customer.retrieve(customer_id)
+                        telegram_id = customer.metadata.get('telegram_id')
+                        logger.info(f"Retrieved telegram_id from customer metadata: {telegram_id}")
+                    except Exception as e:
+                        logger.error(f"Error retrieving customer {customer_id}: {e}")
+                
+                # If still no telegram_id, try to find it by email in Firestore
+                if not telegram_id and customer_id:
+                    try:
+                        customer = stripe.Customer.retrieve(customer_id)
+                        customer_email = customer.email
+                        if customer_email:
+                            logger.info(f"Attempting to find telegram_id by email: {customer_email}")
+                            
+                            # Import FirestoreService here to avoid circular imports
+                            from firestore_service import FirestoreService
+                            project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+                            firestore_service = FirestoreService(project_id)
+                            
+                            # Try to find user by email
+                            user_data = firestore_service.get_user_by_email(customer_email)
+                            if user_data and user_data.get('telegram_id'):
+                                telegram_id = user_data['telegram_id']
+                                logger.info(f"Found telegram_id by email lookup: {telegram_id}")
+                                
+                                # Update the Stripe customer with the found telegram_id
+                                try:
+                                    stripe.Customer.modify(
+                                        customer_id,
+                                        metadata={
+                                            'telegram_id': str(telegram_id),
+                                            'telegram_username': user_data.get('username', ''),
+                                            'source': 'gcp-bot',
+                                            'linked_by_email': 'true'
+                                        }
+                                    )
+                                    logger.info(f"Updated Stripe customer {customer_id} with telegram_id {telegram_id}")
+                                except Exception as e:
+                                    logger.error(f"Failed to update Stripe customer metadata: {e}")
+                            else:
+                                logger.warning(f"Customer {customer_id} ({customer_email}) has no telegram_id - manual intervention required")
+                    except Exception as e:
+                        logger.error(f"Error getting customer email: {e}")
+            
+            if not telegram_id:
+                logger.error("No telegram_id found in payment metadata or customer data")
+                logger.error(f"Session metadata: {metadata}")
+                logger.error("This payment cannot be processed - customer needs manual linking")
                 return None
             
             # For subscriptions, get the actual subscription period from Stripe

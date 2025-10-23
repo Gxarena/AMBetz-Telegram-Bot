@@ -7,6 +7,7 @@ from telegram import Update
 from firestore_service import FirestoreService
 from gcp_stripe_service import GCPStripeService
 from gcp_bot import GCPTelegramBot
+from webhook_validator import WebhookValidator
 import json
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
@@ -21,6 +22,7 @@ app = FastAPI(title="Telegram Bot Webhook Handler")
 project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
 firestore_service = FirestoreService(project_id)
 stripe_service = GCPStripeService(project_id)
+webhook_validator = WebhookValidator(stripe_service)
 
 # Initialize Telegram bot (will be done lazily in webhook function)
 telegram_bot = None
@@ -125,6 +127,22 @@ async def stripe_webhook(request: Request):
                 session_id = session.id
                 logger.info(f"Session ID: {session_id}")
                 
+                # VALIDATE: Ensure this session was created through the bot
+                validation_result = webhook_validator.validate_checkout_session(session)
+                if not validation_result['valid']:
+                    logger.warning(f"Session {session_id} failed validation: {validation_result['error']}")
+                    webhook_validator.log_validation_failure(session_id, validation_result['error'], validation_result['action'])
+                    
+                    if validation_result['action'] == 'reject_payment':
+                        # This is a serious security issue - someone bypassed the bot
+                        logger.error(f"SECURITY ALERT: Unauthorized subscription attempt for session {session_id}")
+                        # You might want to send admin alerts here
+                        return JSONResponse(content={"status": "error", "message": "unauthorized_subscription"})
+                    else:
+                        return JSONResponse(content={"status": "success", "message": "validation_failed"})
+                
+                logger.info(f"Session {session_id} passed validation for telegram_id: {validation_result['telegram_id']}")
+                
                 # Check if this session was already processed to prevent duplicates
                 existing_subscription = firestore_service.get_subscription_by_stripe_session(session_id)
                 if existing_subscription:
@@ -173,74 +191,50 @@ async def stripe_webhook(request: Request):
                     
                     # Return success to Stripe but don't create new subscription
                     return JSONResponse(content={"status": "success", "message": "subscription_blocked"})
-                
-                # Save subscription to Firestore (only if no active subscription exists)
-                success = firestore_service.upsert_subscription(
-                    telegram_id=subscription_data['telegram_id'],
-                    start_date=subscription_data['start_date'],
-                    expiry_date=subscription_data['expiry_date'],
-                    subscription_type=subscription_data['subscription_type'],
-                    stripe_customer_id=subscription_data['stripe_customer_id'],
-                    stripe_session_id=subscription_data['stripe_session_id'],
-                    amount_paid=subscription_data['amount_paid'],
-                    currency=subscription_data['currency']
-                )
-                
-                if success:
-                    logger.info(f"Subscription created for user {subscription_data['telegram_id']}")
-                    
-                    # Generate and send one-time invite links
-                    try:
-                        bot_app = await get_bot_application()
-                        
-                        # Get user info for username
-                        logger.info(f"Getting user info for telegram_id: {subscription_data['telegram_id']}")
-                        user_info = firestore_service.get_user(subscription_data['telegram_id'])
-                        logger.info(f"User info type: {type(user_info)}")
-                        logger.info(f"User info content: {user_info}")
-                        
-                        try:
-                            username = user_info.get("username") if user_info else None
-                            logger.info(f"Username extracted: {username}")
-                        except Exception as e:
-                            logger.error(f"Error getting username from user_info: {e}")
-                            logger.error(f"User info type: {type(user_info)}")
-                            logger.error(f"User info content: {user_info}")
-                            username = None
-                        
-                        # Create bot instance and set up application
-                        telegram_bot = GCPTelegramBot()
-                        telegram_bot.application = bot_app
-                        
-                        # Generate one-time invite links
-                        invite_links = await telegram_bot.generate_one_time_invite_links(
-                            subscription_data['telegram_id'], 
-                            username
-                        )
-                        
-                        # Send invite links to user
-                        await telegram_bot.send_vip_invite_links(
-                            subscription_data['telegram_id'],
-                            invite_links,
-                            username
-                        )
-                        
-                        logger.info(f"Sent invite links to user {subscription_data['telegram_id']}")
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to send invite links to user {subscription_data['telegram_id']}: {e}")
-                        # Send fallback message
-                        try:
-                            await bot_app.bot.send_message(
-                                chat_id=subscription_data['telegram_id'],
-                                text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact AM for your invite links."
-                            )
-                        except Exception as fallback_error:
-                            logger.error(f"Failed to send fallback message: {fallback_error}")
-                else:
-                    logger.error(f"Failed to save subscription for user {subscription_data['telegram_id']}")
             else:
-                logger.error("Failed to process payment data")
+                # Handle case where subscription_data is None (no telegram_id found)
+                logger.error("Failed to process payment - no subscription data generated")
+                logger.error("This usually means the customer has no telegram_id linked")
+                
+                # Try to get customer info for manual intervention
+                try:
+                    if hasattr(session, 'customer'):
+                        customer = stripe.Customer.retrieve(session.customer)
+                        logger.error(f"Customer {customer.id} ({customer.email}) needs manual linking")
+                        
+                        # Send admin notification about failed payment
+                        try:
+                            from google.cloud import secretmanager
+                            secret_client = secretmanager.SecretManagerServiceClient()
+                            project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+                            
+                            secret_name = f"projects/{project_id}/secrets/admin-telegram-id/versions/latest"
+                            response = secret_client.access_secret_version(request={"name": secret_name})
+                            admin_ids_str = response.payload.data.decode("UTF-8").strip()
+                            
+                            admin_ids = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if id_str.strip()]
+                            
+                            bot_app = await get_bot_application()
+                            for admin_id in admin_ids:
+                                try:
+                                    await bot_app.bot.send_message(
+                                        chat_id=admin_id,
+                                        text=f"⚠️ **Payment Processing Failed**\n\n"
+                                             f"Customer: {customer.email}\n"
+                                             f"Stripe ID: {customer.id}\n"
+                                             f"Session: {session_id}\n\n"
+                                             f"Reason: No Telegram ID found\n"
+                                             f"Action: Manual intervention required"
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to send admin notification: {e}")
+                        except Exception as e:
+                            logger.error(f"Failed to send admin notifications: {e}")
+                except Exception as e:
+                    logger.error(f"Failed to get customer info: {e}")
+                
+                # Return success to Stripe to prevent retries, but log the issue
+                return JSONResponse(content={"status": "success", "message": "payment_logged_for_manual_review"})
         
         elif event.type == 'invoice.payment_succeeded':
             logger.info("Processing invoice.payment_succeeded event (recurring payment)")
