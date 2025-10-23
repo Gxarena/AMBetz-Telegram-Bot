@@ -635,6 +635,26 @@ Contact AM if you have any questions about your subscription.
         # Optionally, you could add a helpful response here
         # await update.message.reply_text("I only respond to commands. Use /help to see available commands.")
 
+    async def handle_group_events(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle group events like new members joining or leaving."""
+        chat_id = update.effective_chat.id
+        chat_title = update.effective_chat.title or "Unknown"
+        
+        # Handle new members joining
+        if update.message.new_chat_members:
+            for member in update.message.new_chat_members:
+                if not member.is_bot:  # Don't log bot joins
+                    logger.info(f"New member {member.username or member.first_name} (ID: {member.id}) joined group '{chat_title}' (ID: {chat_id})")
+        
+        # Handle members leaving
+        if update.message.left_chat_member:
+            member = update.message.left_chat_member
+            if not member.is_bot:  # Don't log bot leaves
+                logger.info(f"Member {member.username or member.first_name} (ID: {member.id}) left group '{chat_title}' (ID: {chat_id})")
+        
+        # Note: We don't process regular group messages here to save costs
+        # Only specific group events are processed
+
     async def get_chat_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Get chat information (temporary command for getting chat IDs)"""
         chat = update.effective_chat
@@ -850,7 +870,15 @@ Contact AM if you have any questions about your subscription.
             logger.info("Production mode: Development commands disabled, /expired enabled")
         
         self.application.add_handler(CallbackQueryHandler(self.button_callback))
-        self.application.add_handler(MessageHandler(filters.ALL, self.handle_message))
+        # Process private messages for user commands
+        self.application.add_handler(MessageHandler(filters.ChatType.PRIVATE, self.handle_message))
+        
+        # Process group messages only for specific operations (new member events, etc.)
+        # This allows group management while saving costs on regular messages
+        self.application.add_handler(MessageHandler(
+            filters.ChatType.GROUPS & (filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER),
+            self.handle_group_events
+        ))
         
         # Set up job to check for expired subscriptions
         job_queue = self.application.job_queue
