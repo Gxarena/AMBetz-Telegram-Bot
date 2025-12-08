@@ -1,6 +1,7 @@
 import stripe
 import os
 import logging
+import pytz
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
@@ -123,6 +124,55 @@ class GCPStripeService:
             logger.error(f"Error creating subscription checkout: {e}")
             raise
     
+    def create_trial_subscription_checkout(self, telegram_id: int, telegram_username: str = None, trial_days: int = 3) -> str:
+        """Create a Stripe checkout session for subscription with free trial period"""
+        if not self.is_configured:
+            raise ValueError("Stripe is not configured")
+            
+        try:
+            # Sanitize username to remove problematic Unicode characters
+            sanitized_username = self._sanitize_string(telegram_username) if telegram_username else ""
+            
+            # Create or retrieve customer
+            customer = self.get_or_create_customer(telegram_id, sanitized_username)
+            
+            # Create checkout session for subscription with trial period
+            checkout_session = stripe.checkout.Session.create(
+                customer=customer.id,
+                payment_method_types=['card'],
+                line_items=[
+                    {
+                        'price': self.price_id,
+                        'quantity': 1,
+                    },
+                ],
+                mode='subscription',
+                subscription_data={
+                    'trial_period_days': trial_days,
+                    'metadata': {
+                        "telegram_id": str(telegram_id),
+                        "telegram_username": sanitized_username,
+                        "source": "gcp-bot",
+                        "is_trial": "true"
+                    }
+                },
+                success_url=f'https://t.me/AMBETZBot?start=success',
+                cancel_url=f'https://t.me/AMBETZBot?start=cancelled',
+                metadata={
+                    "telegram_id": str(telegram_id),
+                    "telegram_username": sanitized_username,
+                    "source": "gcp-bot",
+                    "is_trial": "true"
+                }
+            )
+            
+            logger.info(f"Trial subscription checkout session created for user {telegram_id} with {trial_days} day trial")
+            return checkout_session.url
+            
+        except Exception as e:
+            logger.error(f"Error creating trial subscription checkout: {e}")
+            raise
+    
     def get_or_create_customer(self, telegram_id: int, telegram_username: str = None) -> stripe.Customer:
         """Get existing customer or create new one"""
         if not self.is_configured:
@@ -135,15 +185,22 @@ class GCPStripeService:
             )
             
             if customers.data:
-                # Check if customer has active subscriptions
+                # Check if customer has active subscriptions (excluding trials)
                 customer_id = customers.data[0].id
                 active_subscriptions = stripe.Subscription.list(customer=customer_id, status='active')
+                trialing_subscriptions = stripe.Subscription.list(customer=customer_id, status='trialing')
                 
+                # Check for active (non-trial) subscriptions
                 if active_subscriptions.data:
                     # Customer already has active subscription - this should not happen
                     # The bot should have prevented this, but as a safety measure, raise an error
                     logger.warning(f"Customer {customer_id} already has active subscription, rejecting new subscription attempt")
                     raise ValueError(f"Customer already has an active subscription. This should have been caught by the bot.")
+                
+                # Allow trialing subscriptions (user might be starting a new trial or converting trial to paid)
+                # The bot logic will handle preventing duplicate trials
+                if trialing_subscriptions.data:
+                    logger.info(f"Customer {customer_id} has trialing subscription, allowing access")
                 
                 return customers.data[0]
             
@@ -163,6 +220,50 @@ class GCPStripeService:
             logger.error(f"Error handling customer: {e}")
             raise
     
+    def cancel_active_subscriptions(self, telegram_id: int) -> bool:
+        """Cancel all active and trialing subscriptions for a customer (dev/testing only)"""
+        if not self.is_configured:
+            raise ValueError("Stripe is not configured")
+        
+        try:
+            # Find customer by telegram_id
+            customers = stripe.Customer.search(
+                query=f"metadata['telegram_id']:'{telegram_id}'"
+            )
+            
+            if not customers.data:
+                logger.info(f"No Stripe customer found for telegram_id {telegram_id}")
+                return False
+            
+            customer_id = customers.data[0].id
+            cancelled_count = 0
+            
+            # Cancel all active subscriptions
+            active_subscriptions = stripe.Subscription.list(customer=customer_id, status='active')
+            for sub in active_subscriptions.data:
+                try:
+                    stripe.Subscription.cancel(sub.id)
+                    logger.info(f"Cancelled active subscription {sub.id} for customer {customer_id}")
+                    cancelled_count += 1
+                except Exception as e:
+                    logger.error(f"Error cancelling subscription {sub.id}: {e}")
+            
+            # Cancel all trialing subscriptions
+            trialing_subscriptions = stripe.Subscription.list(customer=customer_id, status='trialing')
+            for sub in trialing_subscriptions.data:
+                try:
+                    stripe.Subscription.cancel(sub.id)
+                    logger.info(f"Cancelled trialing subscription {sub.id} for customer {customer_id}")
+                    cancelled_count += 1
+                except Exception as e:
+                    logger.error(f"Error cancelling trialing subscription {sub.id}: {e}")
+            
+            logger.info(f"Cancelled {cancelled_count} subscription(s) for telegram_id {telegram_id}")
+            return cancelled_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error cancelling subscriptions for telegram_id {telegram_id}: {e}")
+            raise
     
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """Verify webhook signature from Stripe"""
@@ -286,14 +387,40 @@ class GCPStripeService:
                 return None
             
             # For subscriptions, get the actual subscription period from Stripe
+            is_trial = False
             if hasattr(session_data, 'subscription') and session_data.subscription:
                 # This is a subscription checkout, get the subscription details
                 subscription = stripe.Subscription.retrieve(session_data.subscription)
-                start_date = datetime.fromtimestamp(subscription.current_period_start)
-                expiry_date = datetime.fromtimestamp(subscription.current_period_end)
+                
+                # Check if this is a trial subscription
+                is_trial = subscription.status == 'trialing' or metadata.get('is_trial') == 'true'
+                
+                # Use current_period_start/current_period_end for both trial and paid subscriptions
+                # For trialing subscriptions, these represent the trial period
+                # For active subscriptions, these represent the billing period
+                if hasattr(subscription, 'current_period_start') and subscription.current_period_start:
+                    # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+                    start_date = datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC)
+                    expiry_date = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
+                elif is_trial and hasattr(subscription, 'trial_start') and subscription.trial_start:
+                    # Fallback for trialing subscriptions: use trial_start/trial_end if current_period_start is missing
+                    logger.warning(f"Subscription {subscription.id} missing current_period_start, using trial_start/trial_end")
+                    start_date = datetime.fromtimestamp(subscription.trial_start, tz=pytz.UTC)
+                    expiry_date = datetime.fromtimestamp(subscription.trial_end, tz=pytz.UTC)
+                elif hasattr(subscription, 'created') and subscription.created:
+                    # Final fallback: use created date + 3 days for trials, 30 days for paid
+                    logger.warning(f"Subscription {subscription.id} missing period dates, using created date + calculated period")
+                    start_date = datetime.fromtimestamp(subscription.created, tz=pytz.UTC)
+                    expiry_date = start_date + timedelta(days=3 if is_trial else 30)
+                else:
+                    raise ValueError(f"Subscription {subscription.id} has no date information available")
+                
+                if is_trial:
+                    logger.info(f"Trial subscription detected for user {telegram_id}, trial ends at {expiry_date}")
             else:
                 # This is a one-time payment, calculate dates manually
-                start_date = datetime.utcnow()
+                # Use timezone-aware datetime for Firestore compatibility
+                start_date = datetime.now(pytz.UTC)
                 # For testing: 1 minute subscription, for production: 30 days
                 if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
                     expiry_date = start_date + timedelta(minutes=1)  # 1 minute for testing
@@ -321,20 +448,31 @@ class GCPStripeService:
             else:
                 currency = session_data.get("currency", "usd")
             
+            # Determine subscription type and metadata
+            subscription_type = "trial" if is_trial else "premium"
+            metadata_dict = {}
+            if is_trial:
+                metadata_dict["is_trial"] = True
+                metadata_dict["trial_started_at"] = datetime.utcnow().isoformat()
+            
             subscription_data = {
                 "telegram_id": int(telegram_id),
                 "stripe_customer_id": customer_id,
                 "stripe_session_id": session_id,
                 "status": "active",
-                "subscription_type": "premium",  # Adjust based on your product
+                "subscription_type": subscription_type,
                 "start_date": start_date,
                 "expiry_date": expiry_date,
-                "amount_paid": amount_total / 100,  # Convert from cents
+                "amount_paid": amount_total / 100,  # Convert from cents (0 for trials)
                 "currency": currency,
-                "updated_at": datetime.utcnow()
+                "updated_at": datetime.utcnow(),
+                "metadata": metadata_dict if metadata_dict else None
             }
             
-            logger.info(f"Payment processed for telegram user {telegram_id}")
+            if is_trial:
+                logger.info(f"Trial subscription processed for telegram user {telegram_id}, expires at {expiry_date}")
+            else:
+                logger.info(f"Payment processed for telegram user {telegram_id}")
             return subscription_data
             
         except Exception as e:

@@ -24,8 +24,10 @@ def setup_cloud_logging():
         logger.warning(f"Could not setup Cloud Logging: {e}")
 
 # Configure logging
+# In development mode, use DEBUG level for more detailed logs
+log_level = logging.DEBUG if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true' else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -120,12 +122,6 @@ class GCPTelegramBot:
             logger.info(f"Ignoring /start command in group chat {update.effective_chat.id}")
             return
         
-        # Create keyboard with Subscribe button
-        keyboard = [
-            [InlineKeyboardButton("Subscribe", callback_data="subscribe")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
         # Get user information
         user_id = update.effective_user.id
         username = update.effective_user.username
@@ -143,6 +139,25 @@ class GCPTelegramBot:
         success = self.firestore_service.create_or_update_user(user_id, user_data)
         if not success:
             logger.error(f"Failed to store user data for {user_id}")
+        
+        # Check if user is eligible for free trial
+        subscription = self.firestore_service.get_subscription(user_id)
+        has_active_subscription = subscription and subscription.get('status') == 'active'
+        has_used_trial = self.firestore_service.has_used_trial(user_id)
+        
+        # Build keyboard based on eligibility
+        keyboard = []
+        
+        # Only show free trial button if:
+        # 1. User doesn't have an active subscription
+        # 2. User hasn't used a trial before
+        if not has_active_subscription and not has_used_trial:
+            keyboard.append([InlineKeyboardButton("🆓 Start Free Trial (3 Days)", callback_data="free_trial")])
+        
+        # Always show subscribe button
+        keyboard.append([InlineKeyboardButton("Subscribe", callback_data="subscribe")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
             f"Welcome to AMBetz, {first_name}! 🎮🏀🏒⚾\n\n"
@@ -432,6 +447,57 @@ Contact AM if you have any questions about your subscription.
             logger.error(f"Error in expired_command: {e}")
             await update.message.reply_text(f"❌ Error checking expired subscriptions: {e}")
 
+    async def resettrial_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Reset trial status for testing (development only)."""
+        user_id = update.effective_user.id
+        
+        # Only respond in private chats
+        if not self._is_private_chat(update):
+            return
+        
+        # Only allow in development mode
+        dev_mode = os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true'
+        if not dev_mode:
+            await update.message.reply_text(
+                "❌ This command is only available in development mode."
+            )
+            return
+        
+        try:
+            # First, cancel any active Stripe subscriptions
+            try:
+                self.stripe_service.cancel_active_subscriptions(user_id)
+            except Exception:
+                pass  # Subscription may not exist
+            
+            # Reset trial status in Firestore
+            self.firestore_service.reset_trial_status(user_id)
+            
+            # Also expire any subscriptions in Firestore for clean testing
+            subscription = self.firestore_service.get_subscription(user_id)
+            if subscription:
+                self.firestore_service.mark_subscription_expired(user_id)
+                await update.message.reply_text(
+                    f"✅ **Trial Status Reset for Testing**\n\n"
+                    f"• Stripe subscription cancelled\n"
+                    f"• Trial usage flag cleared\n"
+                    f"• Firestore subscription expired\n\n"
+                    f"Now you can test the free trial feature!\n\n"
+                    f"Use `/start` to see the free trial button."
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ **Trial Status Reset for Testing**\n\n"
+                    f"• Stripe subscription cancelled (if existed)\n"
+                    f"• Trial usage flag cleared\n\n"
+                    f"Now you can test the free trial feature!\n\n"
+                    f"Use `/start` to see the free trial button."
+                )
+            
+        except Exception as e:
+            logger.error(f"Error resetting trial status for user {user_id}: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error resetting trial status: {e}")
+
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Cancel user's subscription."""
         # Only respond in private chats
@@ -597,6 +663,72 @@ Contact AM if you have any questions about your subscription.
                 await query.message.reply_text(
                     "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
                     "For testing, you can use /test to create a test subscription."
+                )
+        
+        elif query.data == "free_trial":
+            # Check if user already has an active subscription or trial
+            user_id = update.effective_user.id
+            username = update.effective_user.username or "Unknown"
+            
+            existing_subscription = self.firestore_service.get_subscription(user_id)
+            
+            # Check 1: Active subscription
+            if existing_subscription and existing_subscription.get('status') == 'active':
+                expiry_date = existing_subscription['expiry_date']
+                await query.message.reply_text(
+                    f"❌ **Already Have Active Access**\n\n"
+                    f"You already have an active subscription that expires on:\n"
+                    f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                    f"You cannot start a trial while you have an active subscription.\n\n"
+                    f"Use `/status` to check your current subscription."
+                )
+                return
+            
+            # Check 2: Has used trial before
+            has_used_trial = self.firestore_service.has_used_trial(user_id)
+            if has_used_trial:
+                await query.message.reply_text(
+                    f"❌ **Free Trial Already Used**\n\n"
+                    f"You have already used your free trial. Free trials are limited to one per user.\n\n"
+                    f"Click the Subscribe button to get full VIP access with our monthly subscription!"
+                )
+                return
+            
+            # Check if Stripe is configured
+            if self.stripe_service.is_configured:
+                try:
+                    # Create trial subscription checkout (3-day free trial)
+                    trial_url = self.stripe_service.create_trial_subscription_checkout(user_id, username, trial_days=3)
+                    
+                    # Send trial link to user
+                    keyboard = [
+                        [InlineKeyboardButton("🆓 Start Free Trial", url=trial_url)],
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    await query.message.reply_text(
+                        "🆓 **Start Your 3-Day Free Trial!**\n\n"
+                        "Click the button below to start your free trial. No credit card required until the trial ends!\n\n"
+                        "✅ **3 days completely free**\n"
+                        "✅ **Full VIP access** during trial\n"
+                        "✅ **Cancel anytime** before trial ends\n"
+                        "✅ **No charges** during trial period\n\n"
+                        "After 3 days, your subscription will automatically continue at the regular price. "
+                        "You can cancel anytime before the trial ends to avoid charges.\n\n"
+                        "⚠️ **Note:** You'll need to add a payment method to start the trial, but you won't be charged until after 3 days.",
+                        reply_markup=reply_markup
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error creating trial link for user {user_id}: {e}", exc_info=True)
+                    await query.message.reply_text(
+                        f"❌ Sorry, there was an error processing your trial request.\n\n"
+                        f"Please try again later or contact support."
+                    )
+            else:
+                # Stripe not configured - show message
+                await query.message.reply_text(
+                    "Trial subscriptions require Stripe to be configured. Please contact support."
                 )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -864,7 +996,8 @@ Contact AM if you have any questions about your subscription.
             self.application.add_handler(CommandHandler("test", self.test_command))
             self.application.add_handler(CommandHandler("expire", self.expire_command))
             self.application.add_handler(CommandHandler("expired", self.expired_command))
-            logger.info("Development commands (/test, /expire, /expired) enabled")
+            self.application.add_handler(CommandHandler("resettrial", self.resettrial_command))
+            logger.info("Development commands (/test, /expire, /expired, /resettrial) enabled")
         else:
             self.application.add_handler(CommandHandler("expired", self.expired_command))
             logger.info("Production mode: Development commands disabled, /expired enabled")
@@ -902,14 +1035,6 @@ Contact AM if you have any questions about your subscription.
         
         return self.application
 
-    async def run_polling(self):
-        """Run the bot in polling mode"""
-        if not self.application:
-            self.setup_application()
-        
-        logger.info("Starting bot in polling mode...")
-        await self.application.run_polling(allowed_updates=["message", "callback_query"])
-
 def main():
     """Main function to run the bot"""
     try:
@@ -919,9 +1044,19 @@ def main():
         # Setup application
         bot.setup_application()
         
-        # Run the bot
-        asyncio.run(bot.run_polling())
+        # Run the bot - run_polling is synchronous and handles its own event loop
+        if bot.application:
+            logger.info("Starting bot in polling mode...")
+            bot.application.run_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True  # Ignore old updates when restarting
+            )
+        else:
+            logger.error("Bot application not initialized")
+            raise RuntimeError("Bot application not initialized")
         
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
         raise

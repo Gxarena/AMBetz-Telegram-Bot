@@ -1,5 +1,6 @@
 import os
 import logging
+import pytz
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import stripe
@@ -191,6 +192,69 @@ async def stripe_webhook(request: Request):
                     
                     # Return success to Stripe but don't create new subscription
                     return JSONResponse(content={"status": "success", "message": "subscription_blocked"})
+                
+                # Save subscription to Firestore
+                try:
+                    success = firestore_service.upsert_subscription(
+                        telegram_id=subscription_data['telegram_id'],
+                        start_date=subscription_data['start_date'],
+                        expiry_date=subscription_data['expiry_date'],
+                        subscription_type=subscription_data.get('subscription_type', 'premium'),
+                        metadata=subscription_data.get('metadata'),
+                        stripe_customer_id=subscription_data.get('stripe_customer_id'),
+                        stripe_session_id=subscription_data.get('stripe_session_id'),
+                        stripe_subscription_id=subscription_data.get('stripe_subscription_id'),
+                        amount_paid=subscription_data.get('amount_paid'),
+                        currency=subscription_data.get('currency')
+                    )
+                    
+                    if success:
+                        logger.info(f"Subscription saved to Firestore for user {subscription_data['telegram_id']}")
+                        
+                        # Check if this is a trial subscription
+                        is_trial = subscription_data.get('subscription_type') == 'trial' or (subscription_data.get('metadata') and subscription_data['metadata'].get('is_trial'))
+                        
+                        # Mark user as having used trial if this is a trial subscription
+                        if is_trial:
+                            firestore_service.mark_trial_used(subscription_data['telegram_id'])
+                            logger.info(f"Marked user {subscription_data['telegram_id']} as having used a trial")
+                        
+                        # Send welcome message and invite links
+                        try:
+                            bot_app = await get_bot_application()
+                            telegram_bot_instance = GCPTelegramBot()
+                            telegram_bot_instance.application = bot_app
+                            
+                            # Generate and send invite links
+                            invite_links = await telegram_bot_instance.generate_one_time_invite_links(
+                                subscription_data['telegram_id'],
+                                subscription_data.get('telegram_username')
+                            )
+                            
+                            if invite_links:
+                                await telegram_bot_instance.send_vip_invite_links(
+                                    subscription_data['telegram_id'],
+                                    invite_links,
+                                    subscription_data.get('telegram_username')
+                                )
+                            
+                            # Send trial-specific message if applicable
+                            if is_trial:
+                                await bot_app.bot.send_message(
+                                    chat_id=subscription_data['telegram_id'],
+                                    text=f"🎉 **Free Trial Started!**\n\n"
+                                         f"Your 3-day free trial is now active! You have full VIP access until:\n"
+                                         f"**{subscription_data['expiry_date'].strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                                         f"After the trial ends, your subscription will automatically continue at the regular price.\n"
+                                         f"You can cancel anytime before the trial ends to avoid charges.\n\n"
+                                         f"Use `/status` to check your subscription anytime!"
+                                )
+                        except Exception as e:
+                            logger.error(f"Failed to send welcome message/invite links: {e}")
+                    else:
+                        logger.error(f"Failed to save subscription to Firestore for user {subscription_data['telegram_id']}")
+                except Exception as e:
+                    logger.error(f"Error saving subscription to Firestore: {e}")
             else:
                 # Handle case where subscription_data is None (no telegram_id found)
                 logger.error("Failed to process payment - no subscription data generated")
@@ -329,25 +393,39 @@ async def handle_recurring_payment(invoice):
                 if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
                     logger.warning(f"Subscription {subscription_id} has no current_period_end, using invoice date + 30 days")
                     # Fall back to invoice date + 30 days
-                    invoice_date = datetime.fromtimestamp(invoice.created)
+                    # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+                    invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
                     current_period_start = invoice_date
                     current_period_end = invoice_date + timedelta(days=30)
                 else:
-                    current_period_start = datetime.fromtimestamp(subscription.current_period_start)
-                    current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+                    # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+                    current_period_start = datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC)
+                    current_period_end = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
                     
             except Exception as e:
                 logger.warning(f"Could not retrieve subscription {subscription_id}: {e}, using invoice date + 30 days")
-                invoice_date = datetime.fromtimestamp(invoice.created)
+                # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+                invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
                 current_period_start = invoice_date
                 current_period_end = invoice_date + timedelta(days=30)
         else:
             # No subscription ID found - treat as one-time payment
             logger.info(f"No subscription ID found for invoice {invoice.id} - treating as one-time 30-day payment")
-            invoice_date = datetime.fromtimestamp(invoice.created)
+            # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+            invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
             current_period_start = invoice_date
             current_period_end = invoice_date + timedelta(days=30)
             subscription_id = None  # Explicitly set to None
+        
+        # Check if this was a trial conversion (first payment after trial)
+        # If the previous subscription was a trial, mark user as having used trial
+        existing_subscription = firestore_service.get_subscription(int(telegram_id))
+        was_trial = False
+        if existing_subscription:
+            was_trial = (existing_subscription.get('subscription_type') == 'trial' or 
+                        (existing_subscription.get('metadata') and 
+                         isinstance(existing_subscription['metadata'], dict) and 
+                         existing_subscription['metadata'].get('is_trial')))
         
         # Update subscription in Firestore
         success = firestore_service.upsert_subscription(
@@ -363,6 +441,11 @@ async def handle_recurring_payment(invoice):
         )
         
         if success:
+            # If this was a trial conversion, ensure user is marked as having used trial
+            if was_trial:
+                firestore_service.mark_trial_used(int(telegram_id))
+                logger.info(f"Marked user {telegram_id} as having used trial (trial converted to paid)")
+            
             logger.info(f"Updated recurring subscription for user {telegram_id}, expiry: {current_period_end}")
             
             # Notify user about successful renewal
@@ -420,13 +503,14 @@ async def handle_subscription_updated(subscription):
                 logger.warning(f"Subscription {subscription.id} has no current_period_end, skipping update")
                 return
             
-            current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+            # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+            current_period_end = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
             
             # Only update if the expiry date has actually changed
             if existing_subscription.get('expiry_date') != current_period_end:
                 success = firestore_service.upsert_subscription(
                     telegram_id=int(telegram_id),
-                    start_date=datetime.fromtimestamp(subscription.current_period_start),
+                    start_date=datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC),
                     expiry_date=current_period_end,
                     subscription_type="premium",
                     stripe_customer_id=subscription.customer,
@@ -483,12 +567,13 @@ async def handle_subscription_cancelled(subscription):
         
         # Calculate when subscription actually expires (end of current period)
         from datetime import datetime
-        current_period_end = datetime.fromtimestamp(subscription.current_period_end)
+        # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+        current_period_end = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
         
         # Update subscription with cancellation info but keep it active until period end
         success = firestore_service.upsert_subscription(
             telegram_id=int(telegram_id),
-            start_date=datetime.fromtimestamp(subscription.current_period_start),
+            start_date=datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC),
             expiry_date=current_period_end,
             subscription_type="premium",
             stripe_customer_id=subscription.customer,

@@ -35,6 +35,73 @@ class FirestoreService:
         except Exception as e:
             logger.error(f"Error getting user {chat_id}: {e}")
             return None
+    
+    def has_used_trial(self, chat_id: int) -> bool:
+        """
+        Check if user has used a free trial before
+        
+        Args:
+            chat_id: User's Telegram ID
+            
+        Returns:
+            bool: True if user has used a trial, False otherwise
+        """
+        try:
+            user = self.get_user(chat_id)
+            if user:
+                return user.get('has_used_trial', False)
+            
+            # Also check subscription - if they have a trial subscription (active or expired)
+            subscription = self.get_subscription(chat_id)
+            if subscription:
+                subscription_type = subscription.get('subscription_type', '')
+                metadata = subscription.get('metadata', {})
+                # Check if subscription type is trial or metadata indicates trial
+                if subscription_type == 'trial' or (isinstance(metadata, dict) and metadata.get('is_trial')):
+                    return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"Error checking trial usage for user {chat_id}: {e}")
+            return False
+    
+    def mark_trial_used(self, chat_id: int) -> bool:
+        """
+        Mark that a user has used a free trial
+        
+        Args:
+            chat_id: User's Telegram ID
+            
+        Returns:
+            bool: True if operation was successful
+        """
+        try:
+            doc_ref = self.db.collection('users').document(str(chat_id))
+            doc_ref.set({'has_used_trial': True}, merge=True)
+            logger.info(f"Marked user {chat_id} as having used a trial")
+            return True
+        except Exception as e:
+            logger.error(f"Error marking trial as used for user {chat_id}: {e}")
+            return False
+    
+    def reset_trial_status(self, chat_id: int) -> bool:
+        """
+        Reset trial status for testing purposes (development only)
+        
+        Args:
+            chat_id: User's Telegram ID
+            
+        Returns:
+            bool: True if operation was successful
+        """
+        try:
+            doc_ref = self.db.collection('users').document(str(chat_id))
+            doc_ref.set({'has_used_trial': False}, merge=True)
+            logger.info(f"Reset trial status for user {chat_id} (testing)")
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting trial status for user {chat_id}: {e}")
+            return False
 
     def create_or_update_user(self, chat_id: int, user_data: Dict) -> bool:
         """Create or update user data"""
@@ -153,17 +220,40 @@ class FirestoreService:
                 sub_data = doc.to_dict()
                 sub_data['telegram_id'] = int(doc.id)  # Ensure telegram_id is available
                 
+                # Handle both timezone-aware and timezone-naive datetime objects from existing subscriptions
+                expiry_date = sub_data.get('expiry_date')
+                if expiry_date and expiry_date.tzinfo is None:
+                    # If timezone-naive, assume it's UTC (Stripe timestamps are always UTC)
+                    expiry_date = pytz.UTC.localize(expiry_date)
+                    sub_data['expiry_date'] = expiry_date
+                
                 # CRITICAL: If subscription has a stripe_subscription_id (recurring), add a grace period
                 # This prevents race conditions where Stripe renewal webhook fires just before expiry check
                 # Give 5 minutes grace period for Firestore to update from webhook
                 if sub_data.get('stripe_subscription_id'):
                     grace_period_minutes = 5
-                    expiry_with_grace = sub_data['expiry_date'] + timedelta(minutes=grace_period_minutes)
+                    expiry_with_grace = expiry_date + timedelta(minutes=grace_period_minutes)
                     if current_time < expiry_with_grace:
-                        logger.info(f"Skipping user {sub_data['telegram_id']} - has recurring subscription and within {grace_period_minutes}min grace period")
+                        # Check if this is a trial subscription that expired
+                        is_trial = (sub_data.get('subscription_type') == 'trial' or 
+                                   (sub_data.get('metadata') and 
+                                    isinstance(sub_data['metadata'], dict) and 
+                                    sub_data['metadata'].get('is_trial')))
+                        if is_trial:
+                            logger.info(f"Trial subscription for user {sub_data['telegram_id']} expired but within {grace_period_minutes}min grace period - waiting for webhook")
+                        else:
+                            logger.info(f"Skipping user {sub_data['telegram_id']} - has recurring subscription and within {grace_period_minutes}min grace period")
                         continue
                     else:
-                        logger.warning(f"User {sub_data['telegram_id']} has recurring subscription but expired even with grace period - may need manual check")
+                        # Check if this is a trial subscription
+                        is_trial = (sub_data.get('subscription_type') == 'trial' or 
+                                   (sub_data.get('metadata') and 
+                                    isinstance(sub_data['metadata'], dict) and 
+                                    sub_data['metadata'].get('is_trial')))
+                        if is_trial:
+                            logger.warning(f"Trial subscription for user {sub_data['telegram_id']} expired beyond grace period - will be removed. Trial ended at {sub_data['expiry_date']}")
+                        else:
+                            logger.warning(f"User {sub_data['telegram_id']} has recurring subscription but expired even with grace period - may need manual check")
                 
                 expired.append(sub_data)
             
