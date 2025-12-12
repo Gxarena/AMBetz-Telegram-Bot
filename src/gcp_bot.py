@@ -141,9 +141,9 @@ class GCPTelegramBot:
             logger.error(f"Failed to store user data for {user_id}")
         
         # Check if user is eligible for free trial
-        subscription = self.firestore_service.get_subscription(user_id)
-        has_active_subscription = subscription and subscription.get('status') == 'active'
-        has_used_trial = self.firestore_service.has_used_trial(user_id)
+        # subscription = self.firestore_service.get_subscription(user_id)
+        # has_active_subscription = subscription and subscription.get('status') == 'active'
+        # has_used_trial = self.firestore_service.has_used_trial(user_id)
         
         # Build keyboard based on eligibility
         keyboard = []
@@ -151,8 +151,8 @@ class GCPTelegramBot:
         # Only show free trial button if:
         # 1. User doesn't have an active subscription
         # 2. User hasn't used a trial before
-        if not has_active_subscription and not has_used_trial:
-            keyboard.append([InlineKeyboardButton("🆓 Start Free Trial (3 Days)", callback_data="free_trial")])
+        # if not has_active_subscription and not has_used_trial:
+        #     keyboard.append([InlineKeyboardButton("🆓 Start Free Trial (3 Days)", callback_data="free_trial")])
         
         # Always show subscribe button
         keyboard.append([InlineKeyboardButton("Subscribe", callback_data="subscribe")])
