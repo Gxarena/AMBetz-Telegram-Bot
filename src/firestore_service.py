@@ -285,6 +285,48 @@ class FirestoreService:
             logger.error(f"Error marking subscription expired for user {telegram_id}: {e}")
             return False
 
+    def set_subscription_cancelled_expired(
+        self,
+        telegram_id: int,
+        expiry_date: datetime,
+        metadata: Dict[str, Any],
+        stripe_customer_id: str = None,
+        stripe_subscription_id: str = None,
+    ) -> bool:
+        """
+        Set subscription to expired when Stripe sends customer.subscription.deleted.
+        Use this instead of upsert_subscription so we don't overwrite status to 'active'
+        (which would block resubscription). Updates existing doc; does not create.
+
+        Args:
+            telegram_id: User's Telegram ID
+            expiry_date: When the subscription period ended
+            metadata: e.g. {"cancelled": True, "cancelled_at": "..."}
+            stripe_customer_id: Stripe customer ID (optional, for reference)
+            stripe_subscription_id: Stripe subscription ID (optional)
+
+        Returns:
+            bool: True if operation was successful
+        """
+        try:
+            doc_ref = self.db.collection('subscriptions').document(str(telegram_id))
+            update_data = {
+                'status': 'expired',
+                'expiry_date': expiry_date,
+                'metadata': metadata,
+                'updated_at': datetime.utcnow(),
+            }
+            if stripe_customer_id:
+                update_data['stripe_customer_id'] = stripe_customer_id
+            if stripe_subscription_id:
+                update_data['stripe_subscription_id'] = stripe_subscription_id
+            doc_ref.update(update_data)
+            logger.info(f"Set subscription cancelled+expired for user {telegram_id} (resubscription allowed)")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting subscription cancelled+expired for user {telegram_id}: {e}")
+            return False
+
     def get_subscription_by_stripe_session(self, stripe_session_id: str) -> Optional[Dict]:
         """
         Get subscription by Stripe session ID

@@ -2,6 +2,7 @@
 import os
 import logging
 import asyncio
+import pytz
 from datetime import datetime, timedelta
 from typing import Dict, Any
 
@@ -545,8 +546,10 @@ Contact AM if you have any questions about your subscription.
                 import stripe
                 stripe.api_key = self.stripe_service.secret_key
                 
-                # Get active subscriptions for this customer
+                # Get active and trialing subscriptions for this customer (trial users can cancel too)
                 subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='active')
+                if not subscriptions.data:
+                    subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='trialing')
                 
                 if not subscriptions.data:
                     await update.message.reply_text(
@@ -564,6 +567,15 @@ Contact AM if you have any questions about your subscription.
                 
                 # Update Firestore to mark as cancelled
                 expiry_date = subscription.get('expiry_date')
+                if expiry_date is None and stripe_subscription:
+                    # Fallback from Stripe subscription object
+                    end_ts = getattr(stripe_subscription, 'current_period_end', None)
+                    if end_ts:
+                        expiry_date = datetime.fromtimestamp(end_ts, tz=pytz.UTC)
+                if expiry_date is not None and hasattr(expiry_date, 'strftime'):
+                    expiry_str = expiry_date.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    expiry_str = 'end of billing period'
                 success = self.firestore_service.upsert_subscription(
                     telegram_id=user_id,
                     start_date=subscription.get('start_date'),
@@ -580,7 +592,7 @@ Contact AM if you have any questions about your subscription.
                     await update.message.reply_text(
                         f"✅ **Subscription Cancelled Successfully**\n\n"
                         f"Your subscription has been cancelled and will expire on:\n"
-                        f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                        f"**{expiry_str}**\n\n"
                         f"You will continue to have VIP access until then.\n\n"
                         f"Use /start to resubscribe when you're ready to return!"
                     )
@@ -929,38 +941,37 @@ Contact AM if you have any questions about your subscription.
         return invite_links
 
     async def send_vip_invite_links(self, user_id: int, invite_links: Dict[str, str], username: str = None):
-        """Send VIP invite links to the user"""
+        """Send VIP invite links to the user. Plain text (no Markdown) so invite URLs with _ or * don't break parsing."""
         try:
-            message = "🎉 *Welcome to AMBetz VIP!* 🎉\n\n"
+            message = "🎉 Welcome to AMBetz VIP! 🎉\n\n"
             message += "Your subscription is now active! Here are your exclusive invite links:\n\n"
             
             if 'announcements' in invite_links:
-                message += "📢 *VIP Announcements Channel*\n"
+                message += "📢 VIP Announcements Channel\n"
                 message += "Get daily picks and betting tips:\n"
                 message += f"👉 {invite_links['announcements']}\n\n"
             
             if 'discussion' in invite_links:
-                message += "💬 *VIP Discussion Group*\n"
+                message += "💬 VIP Discussion Group\n"
                 message += "Chat with other VIP members:\n"
                 message += f"👉 {invite_links['discussion']}\n\n"
             
-            message += "⚠️ *Important:*\n"
-            message += "• These links are *one-time use only*\n"
-            message += "• They expire in *24 hours*\n"
-            message += "• *Do not share* these links with others\n"
+            message += "⚠️ Important:\n"
+            message += "• These links are one-time use only\n"
+            message += "• They expire in 24 hours\n"
+            message += "• Do not share these links with others\n"
             message += "• Use them immediately to join the VIP groups\n\n"
             
-            message += "🎯 *Next Steps:*\n"
+            message += "🎯 Next Steps:\n"
             message += "1. Click the links above to join both groups\n"
             message += "2. Start receiving daily VIP picks\n"
             message += "3. Connect with other VIP members\n\n"
             
-            message += "Use `/status` to check your subscription anytime!"
+            message += "Use /status to check your subscription anytime!"
             
             await self.application.bot.send_message(
                 chat_id=user_id,
-                text=message,
-                parse_mode="Markdown"
+                text=message
             )
             
             logger.info(f"Sent VIP invite links to user {username} (ID: {user_id})")

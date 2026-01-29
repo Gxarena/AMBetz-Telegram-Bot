@@ -190,10 +190,20 @@ class GCPStripeService:
                 active_subscriptions = stripe.Subscription.list(customer=customer_id, status='active')
                 trialing_subscriptions = stripe.Subscription.list(customer=customer_id, status='trialing')
                 
-                # Check for active (non-trial) subscriptions
-                if active_subscriptions.data:
-                    # Customer already has active subscription - this should not happen
-                    # The bot should have prevented this, but as a safety measure, raise an error
+                # Check for active (non-trial) subscriptions that are not already ending
+                # Allow resubscribe if all "active" subs are cancel_at_period_end and period has passed
+                import time
+                now_ts = int(time.time())
+                truly_active = []
+                for sub in (active_subscriptions.data or []):
+                    period_end = getattr(sub, 'current_period_end', None)
+                    cancel_at_end = getattr(sub, 'cancel_at_period_end', False)
+                    if cancel_at_end and period_end is not None and period_end < now_ts:
+                        # Subscription already ended (Stripe may not have sent deleted yet)
+                        continue
+                    truly_active.append(sub)
+                if truly_active:
+                    # Customer has a real active subscription - block duplicate
                     logger.warning(f"Customer {customer_id} already has active subscription, rejecting new subscription attempt")
                     raise ValueError(f"Customer already has an active subscription. This should have been caught by the bot.")
                 

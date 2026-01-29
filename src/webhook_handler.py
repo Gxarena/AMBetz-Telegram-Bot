@@ -131,7 +131,10 @@ async def stripe_webhook(request: Request):
                 # VALIDATE: Ensure this session was created through the bot
                 validation_result = webhook_validator.validate_checkout_session(session)
                 if not validation_result['valid']:
-                    logger.warning(f"Session {session_id} failed validation: {validation_result['error']}")
+                    logger.warning(
+                        "Checkout session failed validation",
+                        extra={"stripe_session_id": session_id, "error": validation_result['error']}
+                    )
                     webhook_validator.log_validation_failure(session_id, validation_result['error'], validation_result['action'])
                     
                     if validation_result['action'] == 'reject_payment':
@@ -142,7 +145,11 @@ async def stripe_webhook(request: Request):
                     else:
                         return JSONResponse(content={"status": "success", "message": "validation_failed"})
                 
-                logger.info(f"Session {session_id} passed validation for telegram_id: {validation_result['telegram_id']}")
+                telegram_id_val = validation_result['telegram_id']
+                logger.info(
+                    "Checkout session passed validation",
+                    extra={"telegram_id": telegram_id_val, "stripe_session_id": session_id}
+                )
                 
                 # Check if this session was already processed to prevent duplicates
                 existing_subscription = firestore_service.get_subscription_by_stripe_session(session_id)
@@ -168,7 +175,11 @@ async def stripe_webhook(request: Request):
                 # Check if user already has an active subscription
                 existing_subscription = firestore_service.get_subscription(subscription_data['telegram_id'])
                 if existing_subscription and existing_subscription.get('status') == 'active':
-                    logger.warning(f"User {subscription_data['telegram_id']} attempted to subscribe while already having active subscription")
+                    tid = subscription_data['telegram_id']
+                    logger.warning(
+                        "User attempted to subscribe while already active - blocking",
+                        extra={"telegram_id": tid, "stripe_session_id": session_id}
+                    )
                     
                     # Check if this is a duplicate webhook for the same session
                     if existing_subscription.get('stripe_session_id') == session_id:
@@ -209,7 +220,10 @@ async def stripe_webhook(request: Request):
                     )
                     
                     if success:
-                        logger.info(f"Subscription saved to Firestore for user {subscription_data['telegram_id']}")
+                        logger.info(
+                            "Subscription saved to Firestore",
+                            extra={"telegram_id": subscription_data['telegram_id'], "stripe_session_id": subscription_data.get('stripe_session_id')}
+                        )
                         
                         # Check if this is a trial subscription
                         is_trial = subscription_data.get('subscription_type') == 'trial' or (subscription_data.get('metadata') and subscription_data['metadata'].get('is_trial'))
@@ -257,8 +271,10 @@ async def stripe_webhook(request: Request):
                     logger.error(f"Error saving subscription to Firestore: {e}")
             else:
                 # Handle case where subscription_data is None (no telegram_id found)
-                logger.error("Failed to process payment - no subscription data generated")
-                logger.error("This usually means the customer has no telegram_id linked")
+                logger.error(
+                    "Failed to process payment - no subscription data (no telegram_id linked)",
+                    extra={"stripe_session_id": session_id}
+                )
                 
                 # Try to get customer info for manual intervention
                 try:
@@ -566,23 +582,48 @@ async def handle_subscription_cancelled(subscription):
                 return
         
         # Calculate when subscription actually expires (end of current period)
-        from datetime import datetime
-        # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
-        current_period_end = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
-        
-        # Update subscription with cancellation info but keep it active until period end
-        success = firestore_service.upsert_subscription(
+        # Guard: Stripe subscription.deleted object may have current_period_end missing or None
+        current_period_end = None
+        try:
+            period_end_ts = getattr(subscription, 'current_period_end', None)
+            if period_end_ts is not None:
+                current_period_end = datetime.fromtimestamp(period_end_ts, tz=pytz.UTC)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Could not parse current_period_end for subscription {subscription.id}: {e}")
+        if current_period_end is None:
+            # Fallback: use existing Firestore expiry or now
+            existing = firestore_service.get_subscription(int(telegram_id))
+            if existing and existing.get('expiry_date'):
+                current_period_end = existing['expiry_date']
+                if hasattr(current_period_end, 'tzinfo') and current_period_end.tzinfo is None:
+                    current_period_end = pytz.UTC.localize(current_period_end)
+            else:
+                current_period_end = datetime.now(pytz.UTC)
+            logger.info(f"Using fallback expiry for subscription.deleted: {current_period_end}")
+
+        cancellation_metadata = {"cancelled": True, "cancelled_at": datetime.utcnow().isoformat()}
+
+        # IMPORTANT: subscription.deleted means the subscription has ENDED. Set status to 'expired'
+        # so the user can resubscribe. Using upsert_subscription would set status='active' and block
+        # resubscription (e.g. if cron already marked them expired, we'd overwrite back to active).
+        success = firestore_service.set_subscription_cancelled_expired(
             telegram_id=int(telegram_id),
-            start_date=datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC),
             expiry_date=current_period_end,
-            subscription_type="premium",
+            metadata=cancellation_metadata,
             stripe_customer_id=subscription.customer,
-            stripe_session_id=subscription.id,
-            metadata={"cancelled": True, "cancelled_at": datetime.utcnow().isoformat()}
+            stripe_subscription_id=subscription.id,
         )
-        
-        if success:
-            logger.info(f"Updated cancelled subscription for user {telegram_id} - expires at {current_period_end}")
+        if not success:
+            # Fallback: doc may not exist (rare); or update failed - at least mark expired so resubscription works
+            existing = firestore_service.get_subscription(int(telegram_id))
+            if existing:
+                firestore_service.mark_subscription_expired(int(telegram_id))
+                logger.info(f"Fallback: marked subscription expired for user {telegram_id} (resubscription allowed)")
+                success = True
+            else:
+                logger.warning(f"No subscription doc for user {telegram_id} on subscription.deleted - cannot update")
+        else:
+            logger.info(f"Set cancelled+expired for user {telegram_id} - resubscription allowed")
             
             # Get user info for display name
             user_info = firestore_service.get_user(int(telegram_id))
