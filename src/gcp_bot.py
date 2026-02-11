@@ -666,7 +666,12 @@ Contact AM if you have any questions about your subscription.
                     )
                     
                 except Exception as e:
-                    logger.error(f"Error creating payment link: {e}")
+                    user_id = update.effective_user.id
+                    logger.error(
+                        "Error creating subscription checkout - user sees generic message",
+                        extra={"telegram_id": user_id, "error": str(e)},
+                        exc_info=True
+                    )
                     await query.message.reply_text(
                         "❌ Sorry, there was an error processing your request. Please try again later."
                     )
