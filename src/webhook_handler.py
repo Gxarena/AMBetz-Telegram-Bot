@@ -580,7 +580,20 @@ async def handle_subscription_cancelled(subscription):
             else:
                 logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
                 return
-        
+
+        # Only react to deletion of the subscription Firestore considers primary. Cancelling a duplicate
+        # or orphan sub (same customer, different subscription id) must not expire the user or overwrite
+        # stripe_subscription_id — e.g. after cleanup scripts or cancel_other_subscriptions_except.
+        existing = firestore_service.get_subscription(int(telegram_id))
+        tracked_sub_id = existing.get("stripe_subscription_id") if existing else None
+        if tracked_sub_id and tracked_sub_id != subscription.id:
+            logger.info(
+                "Ignoring customer.subscription.deleted for %s: Firestore primary sub is %s (orphan/duplicate removed; no doc change)",
+                subscription.id,
+                tracked_sub_id,
+            )
+            return
+
         # Calculate when subscription actually expires (end of current period)
         # Guard: Stripe subscription.deleted object may have current_period_end missing or None
         current_period_end = None

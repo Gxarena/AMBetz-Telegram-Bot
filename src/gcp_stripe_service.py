@@ -2,12 +2,53 @@ import stripe
 import os
 import logging
 import pytz
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+
+def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    current_period_start/end on Subscription, or from first line item if Stripe omits top-level
+    (common with current API shapes).
+    """
+    try:
+        cs = getattr(sub, "current_period_start", None)
+        ce = getattr(sub, "current_period_end", None)
+        if cs is not None and ce is not None:
+            return int(cs), int(ce)
+    except (TypeError, ValueError):
+        pass
+    items = getattr(sub, "items", None)
+    data = getattr(items, "data", None) if items is not None else None
+    if not data:
+        return None, None
+    it0 = data[0]
+    try:
+        cs = getattr(it0, "current_period_start", None)
+        ce = getattr(it0, "current_period_end", None)
+        if cs is not None and ce is not None:
+            return int(cs), int(ce)
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None, None
+
+
+def _list_subscriptions_paginated(customer_id: str, status: str) -> List[Any]:
+    """All subscriptions for customer with given status."""
+    out: List[Any] = []
+    params: Dict[str, Any] = {"customer": customer_id, "status": status, "limit": 100}
+    while True:
+        page = stripe.Subscription.list(**params)
+        batch = page.data or []
+        out.extend(batch)
+        if not getattr(page, "has_more", False) or not batch:
+            break
+        params["starting_after"] = batch[-1].id
+    return out
 
 class GCPStripeService:
     def __init__(self, project_id: str = None):
@@ -33,7 +74,55 @@ class GCPStripeService:
             logger.info("GCP Stripe service initialized with Secret Manager")
         else:
             logger.warning("Stripe not configured - payment features will be disabled")
-    
+
+    def cancel_terminal_and_incomplete_subscriptions(self, customer_id: str) -> int:
+        """
+        Before starting a new Checkout session: remove subscriptions that are not 'active' or 'trialing'
+        but still block a clean billing story (past_due, unpaid, incomplete). Prevents stacking a
+        second subscription on the same customer while an old one is failed/abandoned.
+        """
+        cancelled = 0
+        for status in ("past_due", "unpaid", "incomplete"):
+            for sub in _list_subscriptions_paginated(customer_id, status):
+                try:
+                    stripe.Subscription.cancel(sub.id)
+                    cancelled += 1
+                    logger.info(
+                        "Cancelled %s subscription %s before new checkout for customer %s",
+                        status,
+                        sub.id,
+                        customer_id,
+                    )
+                except stripe.StripeError as exc:
+                    logger.error(
+                        "Failed to cancel %s subscription %s: %s", status, sub.id, exc
+                    )
+        return cancelled
+
+    def cancel_other_subscriptions_except(self, customer_id: str, keep_subscription_id: str) -> int:
+        """
+        After a successful subscription Checkout: cancel every other subscription on this customer
+        so only the newly paid subscription remains (VIP is single-product).
+        """
+        cancelled = 0
+        for status in ("active", "trialing", "past_due", "unpaid", "incomplete"):
+            for sub in _list_subscriptions_paginated(customer_id, status):
+                if sub.id == keep_subscription_id:
+                    continue
+                try:
+                    stripe.Subscription.cancel(sub.id)
+                    cancelled += 1
+                    logger.info(
+                        "Cancelled extra subscription %s (status=%s) for customer %s; keeping %s",
+                        sub.id,
+                        status,
+                        customer_id,
+                        keep_subscription_id,
+                    )
+                except stripe.StripeError as exc:
+                    logger.error("Failed to cancel subscription %s: %s", sub.id, exc)
+        return cancelled
+
     def _get_secret(self, secret_name: str) -> str:
         """Get secret from GCP Secret Manager"""
         try:
@@ -62,7 +151,8 @@ class GCPStripeService:
         try:
             # Create or retrieve customer
             customer = self.get_or_create_customer(telegram_id, telegram_username)
-            
+            self.cancel_terminal_and_incomplete_subscriptions(customer.id)
+
             # Create payment link
             payment_link = stripe.PaymentLink.create(
                 line_items=[
@@ -96,7 +186,8 @@ class GCPStripeService:
             
             # Create or retrieve customer
             customer = self.get_or_create_customer(telegram_id, sanitized_username)
-            
+            self.cancel_terminal_and_incomplete_subscriptions(customer.id)
+
             # Create checkout session for subscription
             checkout_session = stripe.checkout.Session.create(
                 customer=customer.id,
@@ -135,7 +226,8 @@ class GCPStripeService:
             
             # Create or retrieve customer
             customer = self.get_or_create_customer(telegram_id, sanitized_username)
-            
+            self.cancel_terminal_and_incomplete_subscriptions(customer.id)
+
             # Create checkout session for subscription with trial period
             checkout_session = stripe.checkout.Session.create(
                 customer=customer.id,
@@ -197,7 +289,7 @@ class GCPStripeService:
                 now_ts = int(time.time())
                 truly_active = []
                 for sub in (active_subscriptions.data or []):
-                    period_end = getattr(sub, 'current_period_end', None)
+                    _, period_end = _subscription_period_bounds_unix(sub)
                     if period_end is not None and period_end < now_ts:
                         # Period already ended - treat as over (Stripe may not have sent deleted yet)
                         continue
@@ -395,53 +487,77 @@ class GCPStripeService:
                 logger.error(f"Session metadata: {metadata}")
                 logger.error("This payment cannot be processed - customer needs manual linking")
                 return None
-            
-            # For subscriptions, get the actual subscription period from Stripe
-            is_trial = False
-            if hasattr(session_data, 'subscription') and session_data.subscription:
-                # This is a subscription checkout, get the subscription details
-                subscription = stripe.Subscription.retrieve(session_data.subscription)
-                
-                # Check if this is a trial subscription
-                is_trial = subscription.status == 'trialing' or metadata.get('is_trial') == 'true'
-                
-                # Use current_period_start/current_period_end for both trial and paid subscriptions
-                # For trialing subscriptions, these represent the trial period
-                # For active subscriptions, these represent the billing period
-                if hasattr(subscription, 'current_period_start') and subscription.current_period_start:
-                    # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
-                    start_date = datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC)
-                    expiry_date = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
-                elif is_trial and hasattr(subscription, 'trial_start') and subscription.trial_start:
-                    # Fallback for trialing subscriptions: use trial_start/trial_end if current_period_start is missing
-                    logger.warning(f"Subscription {subscription.id} missing current_period_start, using trial_start/trial_end")
-                    start_date = datetime.fromtimestamp(subscription.trial_start, tz=pytz.UTC)
-                    expiry_date = datetime.fromtimestamp(subscription.trial_end, tz=pytz.UTC)
-                elif hasattr(subscription, 'created') and subscription.created:
-                    # Final fallback: use created date + 3 days for trials, 30 days for paid
-                    logger.warning(f"Subscription {subscription.id} missing period dates, using created date + calculated period")
-                    start_date = datetime.fromtimestamp(subscription.created, tz=pytz.UTC)
-                    expiry_date = start_date + timedelta(days=3 if is_trial else 30)
-                else:
-                    raise ValueError(f"Subscription {subscription.id} has no date information available")
-                
-                if is_trial:
-                    logger.info(f"Trial subscription detected for user {telegram_id}, trial ends at {expiry_date}")
-            else:
-                # This is a one-time payment, calculate dates manually
-                # Use timezone-aware datetime for Firestore compatibility
-                start_date = datetime.now(pytz.UTC)
-                # For testing: 1 minute subscription, for production: 30 days
-                if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
-                    expiry_date = start_date + timedelta(minutes=1)  # 1 minute for testing
-                else:
-                    expiry_date = start_date + timedelta(days=30)  # 30 days for production
-            
-            # Get session data - handle both dict and Stripe object
+
+            # Get session data - handle both dict and Stripe object (needed before subscription cleanup)
             if hasattr(session_data, 'customer'):
                 customer_id = session_data.customer
             else:
                 customer_id = session_data.get("customer")
+
+            subscription_object = None
+            is_trial = False
+
+            # For subscriptions, get the actual subscription period from Stripe
+            if hasattr(session_data, 'subscription') and session_data.subscription:
+                subscription_object = stripe.Subscription.retrieve(
+                    session_data.subscription,
+                    expand=["items.data"],
+                )
+
+                meta_is_trial = False
+                if isinstance(metadata, dict):
+                    meta_is_trial = metadata.get("is_trial") == "true"
+                elif metadata is not None:
+                    try:
+                        meta_is_trial = metadata["is_trial"] == "true"
+                    except Exception:
+                        pass
+                is_trial = (
+                    subscription_object.status == "trialing" or meta_is_trial
+                )
+
+                cps, cpe = _subscription_period_bounds_unix(subscription_object)
+                if cps is not None and cpe is not None:
+                    start_date = datetime.fromtimestamp(cps, tz=pytz.UTC)
+                    expiry_date = datetime.fromtimestamp(cpe, tz=pytz.UTC)
+                elif is_trial and getattr(subscription_object, "trial_start", None) and getattr(
+                    subscription_object, "trial_end", None
+                ):
+                    logger.warning(
+                        "Subscription %s missing item period bounds, using trial_start/trial_end",
+                        subscription_object.id,
+                    )
+                    start_date = datetime.fromtimestamp(
+                        subscription_object.trial_start, tz=pytz.UTC
+                    )
+                    expiry_date = datetime.fromtimestamp(
+                        subscription_object.trial_end, tz=pytz.UTC
+                    )
+                elif getattr(subscription_object, "created", None):
+                    logger.warning(
+                        "Subscription %s missing period bounds, using created + default window",
+                        subscription_object.id,
+                    )
+                    start_date = datetime.fromtimestamp(
+                        subscription_object.created, tz=pytz.UTC
+                    )
+                    expiry_date = start_date + timedelta(days=3 if is_trial else 30)
+                else:
+                    raise ValueError(
+                        f"Subscription {subscription_object.id} has no date information available"
+                    )
+
+                if is_trial:
+                    logger.info(
+                        f"Trial subscription detected for user {telegram_id}, trial ends at {expiry_date}"
+                    )
+            else:
+                # This is a one-time payment, calculate dates manually
+                start_date = datetime.now(pytz.UTC)
+                if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                    expiry_date = start_date + timedelta(minutes=1)
+                else:
+                    expiry_date = start_date + timedelta(days=30)
             
             if hasattr(session_data, 'id'):
                 session_id = session_data.id
@@ -476,9 +592,22 @@ class GCPStripeService:
                 "amount_paid": amount_total / 100,  # Convert from cents (0 for trials)
                 "currency": currency,
                 "updated_at": datetime.utcnow(),
-                "metadata": metadata_dict if metadata_dict else None
+                "metadata": metadata_dict if metadata_dict else None,
             }
-            
+
+            if subscription_object is not None:
+                subscription_data["stripe_subscription_id"] = subscription_object.id
+                if customer_id:
+                    removed = self.cancel_other_subscriptions_except(
+                        str(customer_id), subscription_object.id
+                    )
+                    if removed:
+                        logger.info(
+                            "Post-checkout: cancelled %s other subscription(s) for customer %s",
+                            removed,
+                            customer_id,
+                        )
+
             if is_trial:
                 logger.info(f"Trial subscription processed for telegram user {telegram_id}, expires at {expiry_date}")
             else:
