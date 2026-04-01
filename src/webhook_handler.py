@@ -23,6 +23,7 @@ from webhook_validator import WebhookValidator
 import json
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
+from typing import Any, Dict, Optional, Set
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -40,6 +41,69 @@ webhook_validator = WebhookValidator(stripe_service)
 telegram_bot = None
 bot_application = None
 
+# Filled from GCPTelegramBot after first init; optional env VIP_ANNOUNCEMENTS_ID / VIP_CHAT_ID merge in.
+_vip_chat_ids_cache: Optional[Set[int]] = None
+
+
+def _cache_vip_ids_from_bot(bot: GCPTelegramBot) -> None:
+    global _vip_chat_ids_cache
+    s: Set[int] = set()
+    if bot.vip_announcements_id:
+        s.add(bot.vip_announcements_id)
+    if bot.vip_discussion_id:
+        s.add(bot.vip_discussion_id)
+    _vip_chat_ids_cache = s
+
+
+def _get_vip_chat_ids_for_skip() -> Set[int]:
+    ids: Set[int] = set()
+    for key in ("VIP_ANNOUNCEMENTS_ID", "VIP_CHAT_ID"):
+        v = os.getenv(key)
+        if v:
+            try:
+                ids.add(int(v.strip()))
+            except ValueError:
+                pass
+    if _vip_chat_ids_cache:
+        ids |= _vip_chat_ids_cache
+    return ids
+
+
+def _group_message_payload(update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return update_data.get("message") or update_data.get("edited_message")
+
+
+def _is_plain_group_message_without_join_leave(update_data: Dict[str, Any]) -> bool:
+    """True for normal group/channel messages (candidate for VIP noise skip). Join/leave must be processed."""
+    msg = _group_message_payload(update_data)
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("new_chat_members") or msg.get("left_chat_member"):
+        return False
+    chat = msg.get("chat") or {}
+    return chat.get("type") in ("group", "supergroup", "channel")
+
+
+def _is_skippable_vip_noise(update_data: Dict[str, Any], vip_ids: Set[int]) -> bool:
+    """Plain messages in configured VIP chats — handlers do nothing; skip process_update to save CPU."""
+    if not vip_ids:
+        return False
+    msg = _group_message_payload(update_data)
+    if not isinstance(msg, dict):
+        return False
+    if msg.get("new_chat_members") or msg.get("left_chat_member"):
+        return False
+    chat = msg.get("chat") or {}
+    cid = chat.get("id")
+    if cid is None:
+        return False
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return False
+    return cid in vip_ids
+
+
 async def get_bot_application():
     """Lazily initialize the bot application"""
     global telegram_bot, bot_application
@@ -49,6 +113,8 @@ async def get_bot_application():
         # Initialize the application for webhook mode
         await bot_application.initialize()
         logger.info("Bot application initialized successfully")
+    if telegram_bot:
+        _cache_vip_ids_from_bot(telegram_bot)
     return bot_application
 
 @app.get("/health")
@@ -62,23 +128,35 @@ async def telegram_webhook(request: Request):
     try:
         # Get the update data
         update_data = await request.json()
-        logger.info(f"Received webhook update: {update_data}")
-        
+        logger.debug("Received webhook update: %s", update_data)
+
+        vip_ids = _get_vip_chat_ids_for_skip()
+        if _is_plain_group_message_without_join_leave(update_data) and not vip_ids:
+            await get_bot_application()
+            vip_ids = _get_vip_chat_ids_for_skip()
+
+        if _is_skippable_vip_noise(update_data, vip_ids):
+            logger.debug(
+                "Skipped VIP chat noise (no handlers) update_id=%s",
+                update_data.get("update_id"),
+            )
+            return JSONResponse(content={"status": "ok"})
+
         # Get the bot application (lazy initialization)
         app = await get_bot_application()
-        
+
         # Create Update object
         update = Update.de_json(update_data, app.bot)
         if update is None:
             logger.error(f"Failed to create Update object from: {update_data}")
             return JSONResponse(content={"status": "ok"})
-        
-        logger.info(f"Processing update ID: {update.update_id}")
-        
+
+        logger.debug("Processing update ID: %s", update.update_id)
+
         # Process the update through the bot's handlers
         await app.process_update(update)
-        
-        logger.info(f"Successfully processed update ID: {update.update_id}")
+
+        logger.debug("Successfully processed update ID: %s", update.update_id)
         return JSONResponse(content={"status": "ok"})
         
     except Exception as e:

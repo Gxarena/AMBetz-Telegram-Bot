@@ -377,6 +377,34 @@ class FirestoreService:
             logger.error(f"Error getting subscription by Stripe customer {stripe_customer_id}: {e}")
             return None
 
+    def get_subscription_by_stripe_subscription_id(self, stripe_subscription_id: str) -> Optional[Dict]:
+        """
+        Get subscription document by Stripe subscription id (field on subscriptions/).
+
+        Args:
+            stripe_subscription_id: Stripe Subscription id (sub_...)
+
+        Returns:
+            Subscription dict with telegram_id set from document id, or None
+        """
+        try:
+            query = (
+                self.db.collection("subscriptions")
+                .where(filter=FieldFilter("stripe_subscription_id", "==", stripe_subscription_id))
+                .limit(1)
+            )
+            docs = list(query.stream())
+            if docs:
+                sub_data = docs[0].to_dict()
+                sub_data["telegram_id"] = int(docs[0].id)
+                return sub_data
+            return None
+        except Exception as e:
+            logger.error(
+                f"Error getting subscription by Stripe subscription id {stripe_subscription_id}: {e}"
+            )
+            return None
+
     def get_user_by_email(self, email: str) -> Optional[Dict]:
         """
         Get user by email address
