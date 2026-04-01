@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 
 def _period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Subscription dict subclass: use sub['items'], not sub.items (see gcp_stripe_service)."""
     try:
         cs = getattr(sub, "current_period_start", None)
         ce = getattr(sub, "current_period_end", None)
@@ -30,18 +31,20 @@ def _period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[int]]:
             return int(cs), int(ce)
     except (TypeError, ValueError):
         pass
-    items = getattr(sub, "items", None)
-    data = getattr(items, "data", None) if items is not None else None
+    items_obj = sub.get("items") if hasattr(sub, "get") else None
+    data = None
+    if items_obj is not None:
+        data = items_obj.get("data") if hasattr(items_obj, "get") else getattr(items_obj, "data", None)
     if not data:
         return None, None
-    it0 = data[0]
-    try:
-        cs = getattr(it0, "current_period_start", None)
-        ce = getattr(it0, "current_period_end", None)
-        if cs is not None and ce is not None:
-            return int(cs), int(ce)
-    except (TypeError, ValueError, IndexError):
-        pass
+    for it0 in data:
+        try:
+            cs = it0.get("current_period_start") if hasattr(it0, "get") else getattr(it0, "current_period_start", None)
+            ce = it0.get("current_period_end") if hasattr(it0, "get") else getattr(it0, "current_period_end", None)
+            if cs is not None and ce is not None:
+                return int(cs), int(ce)
+        except (TypeError, ValueError, IndexError):
+            continue
     return None, None
 
 

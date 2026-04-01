@@ -1,4 +1,10 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 import logging
 import pytz
 from fastapi import FastAPI, Request, HTTPException
@@ -6,7 +12,12 @@ from fastapi.responses import JSONResponse
 import stripe
 from telegram import Update
 from firestore_service import FirestoreService
-from gcp_stripe_service import GCPStripeService
+from gcp_stripe_service import (
+    GCPStripeService,
+    _subscription_period_bounds_unix,
+    subscription_fallback_expiry,
+)
+from stripe_compat import metadata_get
 from gcp_bot import GCPTelegramBot
 from webhook_validator import WebhookValidator
 import json
@@ -156,7 +167,45 @@ async def stripe_webhook(request: Request):
                 if existing_subscription:
                     logger.info(f"Session {session_id} already processed, skipping duplicate")
                     return JSONResponse(content={"status": "success", "message": "already_processed"})
-                    
+
+                # Already VIP in Firestore but user completed another Checkout (e.g. bookmarked link).
+                # Must run before handle_successful_payment — that path calls cancel_other_subscriptions_except
+                # and would cancel their valid subscription before we block the Firestore update.
+                prior_vip = firestore_service.get_subscription(telegram_id_val)
+                if prior_vip and prior_vip.get("status") == "active":
+                    prior_session = prior_vip.get("stripe_session_id")
+                    if prior_session != session_id:
+                        logger.warning(
+                            "Duplicate checkout while subscription active; reverting new Stripe subscription",
+                            extra={"telegram_id": telegram_id_val, "stripe_session_id": session_id},
+                        )
+                        stripe_service.revert_duplicate_active_checkout(session)
+                        try:
+                            bot_app = await get_bot_application()
+                            expiry_date = prior_vip["expiry_date"]
+                            ed = (
+                                expiry_date.strftime("%Y-%m-%d %H:%M:%S")
+                                if hasattr(expiry_date, "strftime")
+                                else str(expiry_date)
+                            )
+                            await bot_app.bot.send_message(
+                                chat_id=telegram_id_val,
+                                text=(
+                                    f"❌ **Subscription already active**\n\n"
+                                    f"You already have access until **{ed}**.\n\n"
+                                    f"The extra subscription from this checkout was cancelled. "
+                                    f"Subscription fees are non-refundable; contact support only if "
+                                    f"you believe this was a billing error.\n\n"
+                                    f"Use `/status` to check your subscription."
+                                ),
+                                parse_mode="Markdown",
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to send duplicate-checkout message: {e}")
+                        return JSONResponse(
+                            content={"status": "success", "message": "reverted_duplicate_checkout"}
+                        )
+
             except Exception as e:
                 logger.error(f"Error accessing session object: {e}")
                 logger.error(f"Event data: {event.data}")
@@ -185,24 +234,36 @@ async def stripe_webhook(request: Request):
                     if existing_subscription.get('stripe_session_id') == session_id:
                         logger.info(f"Duplicate webhook for session {session_id}, skipping")
                         return JSONResponse(content={"status": "success", "message": "duplicate_webhook"})
-                    
-                    # Send message to user explaining they can't subscribe again
+
+                    # Should be unreachable if early guard runs first; handle_successful_payment may have
+                    # already called cancel_other_subscriptions_except — reconcile Stripe manually if needed.
+                    logger.critical(
+                        "Active VIP + different checkout session after handle_successful_payment: "
+                        "possible Stripe/Firestore mismatch; reconcile manually if needed "
+                        "(telegram_id=%s, session_id=%s)",
+                        tid,
+                        session_id,
+                    )
+                    stripe_service.revert_duplicate_active_checkout(session)
                     try:
                         bot_app = await get_bot_application()
-                        expiry_date = existing_subscription['expiry_date']
+                        expiry_date = existing_subscription["expiry_date"]
                         await bot_app.bot.send_message(
-                            chat_id=subscription_data['telegram_id'],
-                            text=f"❌ **Subscription Already Active**\n\n"
-                                 f"You already have an active subscription that expires on:\n"
-                                 f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
-                                 f"You cannot subscribe again until your current subscription expires.\n\n"
-                                 f"Use `/status` to check your current subscription."
+                            chat_id=tid,
+                            text=(
+                                f"❌ **Subscription already active**\n\n"
+                                f"You already have access until **{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**.\n\n"
+                                f"The extra subscription from this checkout was cancelled. "
+                                f"Subscription fees are non-refundable; contact support only if "
+                                f"you believe this was a billing error.\n\n"
+                                f"Use `/status` to check your subscription."
+                            ),
+                            parse_mode="Markdown",
                         )
                     except Exception as e:
                         logger.error(f"Failed to send subscription blocked message: {e}")
-                    
-                    # Return success to Stripe but don't create new subscription
-                    return JSONResponse(content={"status": "success", "message": "subscription_blocked"})
+
+                    return JSONResponse(content={"status": "success", "message": "subscription_blocked_fallback"})
                 
                 # Save subscription to Firestore
                 try:
@@ -224,7 +285,18 @@ async def stripe_webhook(request: Request):
                             "Subscription saved to Firestore",
                             extra={"telegram_id": subscription_data['telegram_id'], "stripe_session_id": subscription_data.get('stripe_session_id')}
                         )
-                        
+                        cust_id = subscription_data.get("stripe_customer_id")
+                        if cust_id:
+                            expired_n = stripe_service.expire_open_checkout_sessions_for_customer(
+                                cust_id
+                            )
+                            if expired_n:
+                                logger.info(
+                                    "Expired %s open Checkout session(s) for customer %s",
+                                    expired_n,
+                                    cust_id,
+                                )
+
                         # Check if this is a trial subscription
                         is_trial = subscription_data.get('subscription_type') == 'trial' or (subscription_data.get('metadata') and subscription_data['metadata'].get('is_trial'))
                         
@@ -251,6 +323,13 @@ async def stripe_webhook(request: Request):
                                     invite_links,
                                     subscription_data.get('telegram_username')
                                 )
+                            else:
+                                logger.error(
+                                    "VIP_INVITE_LINKS: checkout completed but no links to send "
+                                    "(see VIP_INVITE_LINKS logs above) telegram_id=%s stripe_session_id=%s",
+                                    subscription_data["telegram_id"],
+                                    subscription_data.get("stripe_session_id"),
+                                )
                             
                             # Send trial-specific message if applicable
                             if is_trial:
@@ -264,7 +343,13 @@ async def stripe_webhook(request: Request):
                                          f"Use `/status` to check your subscription anytime!"
                                 )
                         except Exception as e:
-                            logger.error(f"Failed to send welcome message/invite links: {e}")
+                            logger.error(
+                                "VIP_INVITE_LINKS: welcome/invite block failed telegram_id=%s stripe_session_id=%s: %s",
+                                subscription_data.get("telegram_id"),
+                                subscription_data.get("stripe_session_id"),
+                                e,
+                                exc_info=True,
+                            )
                     else:
                         logger.error(f"Failed to save subscription to Firestore for user {subscription_data['telegram_id']}")
                 except Exception as e:
@@ -360,7 +445,7 @@ async def handle_recurring_payment(invoice):
         
         # Get customer details to get telegram_id
         customer = stripe.Customer.retrieve(customer_id)
-        telegram_id = customer.metadata.get('telegram_id')
+        telegram_id = metadata_get(customer.metadata, "telegram_id")
         
         if not telegram_id:
             logger.warning(f"No telegram_id found in customer metadata: {customer_id} (email: {customer.email})")
@@ -403,21 +488,24 @@ async def handle_recurring_payment(invoice):
         # If we have a subscription ID, use it to get accurate period dates
         if subscription_id:
             try:
-                subscription = stripe.Subscription.retrieve(subscription_id)
-                
-                # Check if current_period_end exists
-                if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
-                    logger.warning(f"Subscription {subscription_id} has no current_period_end, using invoice date + 30 days")
-                    # Fall back to invoice date + 30 days
-                    # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+                subscription = stripe.Subscription.retrieve(
+                    subscription_id, expand=["items.data", "items.data.price"]
+                )
+                cps, cpe = _subscription_period_bounds_unix(subscription)
+                if cps is not None and cpe is not None:
+                    current_period_start = datetime.fromtimestamp(cps, tz=pytz.UTC)
+                    current_period_end = datetime.fromtimestamp(cpe, tz=pytz.UTC)
+                else:
+                    logger.warning(
+                        f"Subscription {subscription_id} has no period bounds; "
+                        f"using invoice date start + price.recurring fallback (or 30d)"
+                    )
                     invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
                     current_period_start = invoice_date
-                    current_period_end = invoice_date + timedelta(days=30)
-                else:
-                    # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
-                    current_period_start = datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC)
-                    current_period_end = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
-                    
+                    is_tr = getattr(subscription, "status", None) == "trialing"
+                    current_period_end = subscription_fallback_expiry(
+                        subscription, invoice_date, is_trial=is_tr
+                    )
             except Exception as e:
                 logger.warning(f"Could not retrieve subscription {subscription_id}: {e}, using invoice date + 30 days")
                 # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
@@ -489,7 +577,7 @@ async def handle_subscription_updated(subscription):
         
         # Get customer details
         customer = stripe.Customer.retrieve(subscription.customer)
-        telegram_id = customer.metadata.get('telegram_id')
+        telegram_id = metadata_get(customer.metadata, "telegram_id")
         
         if not telegram_id:
             logger.warning(f"No telegram_id found in customer metadata: {subscription.customer} (email: {customer.email})")
@@ -513,20 +601,25 @@ async def handle_subscription_updated(subscription):
         
         # Check if subscription is still active
         if subscription.status in ['active', 'trialing']:
-            # Subscription is active, update expiry date
-            # Check if current_period_end exists
-            if not hasattr(subscription, 'current_period_end') or subscription.current_period_end is None:
-                logger.warning(f"Subscription {subscription.id} has no current_period_end, skipping update")
+            # Periods often live on subscription items, not top-level (Stripe API shape).
+            sub_full = stripe.Subscription.retrieve(
+                subscription.id, expand=["items.data", "items.data.price"]
+            )
+            cps, cpe = _subscription_period_bounds_unix(sub_full)
+            if cps is None or cpe is None:
+                logger.warning(
+                    f"Subscription {subscription.id} has no current period bounds, skipping update"
+                )
                 return
-            
-            # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
-            current_period_end = datetime.fromtimestamp(subscription.current_period_end, tz=pytz.UTC)
-            
+
+            current_period_start = datetime.fromtimestamp(cps, tz=pytz.UTC)
+            current_period_end = datetime.fromtimestamp(cpe, tz=pytz.UTC)
+
             # Only update if the expiry date has actually changed
             if existing_subscription.get('expiry_date') != current_period_end:
                 success = firestore_service.upsert_subscription(
                     telegram_id=int(telegram_id),
-                    start_date=datetime.fromtimestamp(subscription.current_period_start, tz=pytz.UTC),
+                    start_date=current_period_start,
                     expiry_date=current_period_end,
                     subscription_type="premium",
                     stripe_customer_id=subscription.customer,
@@ -566,7 +659,7 @@ async def handle_subscription_cancelled(subscription):
         
         # Get customer details
         customer = stripe.Customer.retrieve(subscription.customer)
-        telegram_id = customer.metadata.get('telegram_id')
+        telegram_id = metadata_get(customer.metadata, "telegram_id")
         
         if not telegram_id:
             logger.warning(f"No telegram_id found in customer metadata: {subscription.customer} (email: {customer.email})")
@@ -719,7 +812,7 @@ async def handle_payment_failed(invoice):
         # Get subscription details
         subscription = stripe.Subscription.retrieve(subscription_id)
         customer = stripe.Customer.retrieve(subscription.customer)
-        telegram_id = customer.metadata.get('telegram_id')
+        telegram_id = metadata_get(customer.metadata, "telegram_id")
         
         if not telegram_id:
             logger.warning(f"No telegram_id found in customer metadata: {subscription.customer} (email: {customer.email})")

@@ -1,26 +1,40 @@
 # AMBetz VIP Telegram Bot
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load repo-root .env for local runs (`python src/gcp_bot.py` does not load it otherwise)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 import logging
 import asyncio
 import pytz
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Any, Dict, List
 
 from google.cloud import logging as cloud_logging
 from google.cloud import secretmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
-from firestore_service import FirestoreService
-from gcp_stripe_service import GCPStripeService
+import stripe
+from stripe import StripeError
 
-# Setup Cloud Logging
+from firestore_service import FirestoreService
+from gcp_stripe_service import ActiveSubscriptionExistsError, GCPStripeService
+
+# Setup Cloud Logging (only on Cloud Run — locally use console logging; avoids wrong quota project from ADC)
+def _running_on_cloud_run() -> bool:
+    return bool(os.getenv("K_SERVICE"))
+
 def setup_cloud_logging():
-    """Setup Google Cloud Logging"""
+    """Ship logs to Cloud Logging (production). Uses GOOGLE_CLOUD_PROJECT explicitly."""
     try:
-        cloud_logging_client = cloud_logging.Client()
+        project = os.getenv("GOOGLE_CLOUD_PROJECT")
+        cloud_logging_client = cloud_logging.Client(project=project)
         cloud_logging_client.setup_logging()
-        logger.info("Cloud Logging configured")
+        logger.info("Cloud Logging configured for project %s", project)
     except Exception as e:
         logger.warning(f"Could not setup Cloud Logging: {e}")
 
@@ -33,8 +47,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Setup cloud logging if running in GCP
-if os.getenv('GOOGLE_CLOUD_PROJECT'):
+# Local dev: skip Cloud Logging (ADC quota project may point at an old/deleted GCP project).
+# Cloud Run sets K_SERVICE — enable Cloud Logging there only.
+if os.getenv("GOOGLE_CLOUD_PROJECT") and _running_on_cloud_run():
     setup_cloud_logging()
 
 class GCPTelegramBot:
@@ -107,14 +122,66 @@ class GCPTelegramBot:
             return response.payload.data.decode("UTF-8")
         except Exception as e:
             logger.error(f"Error accessing secret {secret_name}: {e}")
-            # Fallback to environment variables for development
-            return os.getenv(secret_name.upper().replace('-', '_'))
+            key = secret_name.upper().replace("-", "_")
+            val = os.getenv(key)
+            if val:
+                return val
+            if os.getenv("DEVELOPMENT_MODE", "false").lower() == "true" and secret_name.endswith(
+                "-test"
+            ):
+                base = secret_name[: -len("-test")]
+                val2 = os.getenv(base.upper().replace("-", "_"))
+                if val2:
+                    return val2
+            # DEVELOPMENT_MODE=false expects TELEGRAM_BOT_TOKEN; many local .env files only set TELEGRAM_BOT_TOKEN_TEST
+            if (
+                not val
+                and os.getenv("DEVELOPMENT_MODE", "false").lower() != "true"
+                and secret_name == "telegram-bot-token"
+            ):
+                alt = os.getenv("TELEGRAM_BOT_TOKEN_TEST")
+                if alt:
+                    logger.warning(
+                        "TELEGRAM_BOT_TOKEN is unset; using TELEGRAM_BOT_TOKEN_TEST. "
+                        "Set TELEGRAM_BOT_TOKEN for production-style local runs."
+                    )
+                    return alt
+            return val or ""
 
     def _is_private_chat(self, update: Update) -> bool:
         """Check if the current chat is a private chat (PM)"""
         if not update.effective_chat:
             return False
         return update.effective_chat.type == Chat.PRIVATE
+
+    def build_main_menu_keyboard(self) -> InlineKeyboardMarkup:
+        """Subscribe full width; other commands in two columns below."""
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⭐ Subscribe", callback_data="subscribe")],
+                [
+                    InlineKeyboardButton("📊 Status", callback_data="menu_status"),
+                    InlineKeyboardButton("❓ Help", callback_data="menu_help"),
+                ],
+                [
+                    InlineKeyboardButton("🚫 Cancel subscription", callback_data="menu_cancel"),
+                    InlineKeyboardButton("ℹ️ Chat info", callback_data="menu_chatinfo"),
+                ],
+            ]
+        )
+
+    @staticmethod
+    def _subscription_checkout_message_text() -> str:
+        """Shared copy for checkout (single or multi-plan)."""
+        return (
+            "🎉 **Choose your plan** and pay securely through Stripe.\n\n"
+            "Tap your billing period below. Each plan renews automatically until you cancel.\n\n"
+            "✅ Secure payment processing\n"
+            "✅ Instant activation\n"
+            "✅ Recurring subscription (renews on your plan’s schedule)\n"
+            "✅ Auto-renewal (cancel anytime)\n\n"
+            "Subscription fees are non-refundable; cancel anytime to stop future charges."
+        )
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /start is issued."""
@@ -146,19 +213,7 @@ class GCPTelegramBot:
         # has_active_subscription = subscription and subscription.get('status') == 'active'
         # has_used_trial = self.firestore_service.has_used_trial(user_id)
         
-        # Build keyboard based on eligibility
-        keyboard = []
-        
-        # Only show free trial button if:
-        # 1. User doesn't have an active subscription
-        # 2. User hasn't used a trial before
-        # if not has_active_subscription and not has_used_trial:
-        #     keyboard.append([InlineKeyboardButton("🆓 Start Free Trial (3 Days)", callback_data="free_trial")])
-        
-        # Always show subscribe button
-        keyboard.append([InlineKeyboardButton("Subscribe", callback_data="subscribe")])
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = self.build_main_menu_keyboard()
         
         await update.message.reply_text(
             f"Welcome to AMBetz, {first_name}! 🎮🏀🏒⚾\n\n"
@@ -184,45 +239,47 @@ class GCPTelegramBot:
         user_id = update.effective_user.id
         
         try:
-            # Get subscription from Firestore
-            subscription = self.firestore_service.get_subscription(user_id)
-            
-            if subscription:
-                start_date = subscription.get("start_date")
-                expiry_date = subscription.get("expiry_date")
-                status = subscription.get("status", "unknown")
-                subscription_type = subscription.get("subscription_type", "basic")
-                
-                # Format dates
-                start_str = start_date.strftime("%Y-%m-%d %H:%M:%S") if start_date else "N/A"
-                expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S") if expiry_date else "N/A"
-                
-                message = (
-                    f"📊 *Subscription Status*\n\n"
-                    f"Status: {status.upper()}\n"
-                    f"Type: {subscription_type}\n"
-                    f"Start Date: {start_str}\n"
-                    f"Expiry Date: {expiry_str}\n"
-                )
-                
-                # Create renewal button if expired
-                if status == "expired":
-                    keyboard = [[InlineKeyboardButton("Renew Subscription", callback_data="subscribe")]]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode="Markdown")
-                else:
-                    await update.message.reply_text(message, parse_mode="Markdown")
-            else:
-                # No subscription found
-                keyboard = [[InlineKeyboardButton("Subscribe Now", callback_data="subscribe")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_text(
-                    "You don't have an active subscription. Subscribe now to get started!",
-                    reply_markup=reply_markup
-                )
+            await self._send_status_reply(update, user_id)
         except Exception as e:
             logger.error(f"Error in status_command: {e}")
-            await update.message.reply_text(f"❌ Error checking subscription status: {e}")
+            await update.effective_message.reply_text(f"❌ Error checking subscription status: {e}")
+
+    async def _send_status_reply(self, update: Update, user_id: int) -> None:
+        """Send status text; works from /status and from menu button callbacks."""
+        subscription = self.firestore_service.get_subscription(user_id)
+
+        if subscription:
+            start_date = subscription.get("start_date")
+            expiry_date = subscription.get("expiry_date")
+            status = subscription.get("status", "unknown")
+            subscription_type = subscription.get("subscription_type", "basic")
+
+            start_str = start_date.strftime("%Y-%m-%d %H:%M:%S") if start_date else "N/A"
+            expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S") if expiry_date else "N/A"
+
+            message = (
+                f"📊 *Subscription Status*\n\n"
+                f"Status: {status.upper()}\n"
+                f"Type: {subscription_type}\n"
+                f"Start Date: {start_str}\n"
+                f"Expiry Date: {expiry_str}\n"
+            )
+
+            if status == "expired":
+                keyboard = [[InlineKeyboardButton("Renew Subscription", callback_data="subscribe")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.effective_message.reply_text(
+                    message, reply_markup=reply_markup, parse_mode="Markdown"
+                )
+            else:
+                await update.effective_message.reply_text(message, parse_mode="Markdown")
+        else:
+            keyboard = [[InlineKeyboardButton("Subscribe Now", callback_data="subscribe")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.effective_message.reply_text(
+                "You don't have an active subscription. Subscribe now to get started!",
+                reply_markup=reply_markup,
+            )
 
     async def add_user_to_vip_groups(self, user_id: int, username: str = None) -> bool:
         """Add user to both VIP groups (announcements and discussion)"""
@@ -294,7 +351,10 @@ class GCPTelegramBot:
         if not self._is_private_chat(update):
             logger.info(f"Ignoring /help command in group chat {update.effective_chat.id}")
             return
-        
+
+        await self._send_help_reply(update)
+
+    async def _send_help_reply(self, update: Update) -> None:
         help_text = """
 🎮🏀🏒⚾ *AMBetz VIP Betting Tips*
 
@@ -306,14 +366,13 @@ class GCPTelegramBot:
 
 *How to Subscribe:*
 1. Use /start to see subscription options
-2. Click "Subscribe" to begin payment process
-3. Complete payment securely through Stripe
-4. Receive exclusive one-time invite links for VIP groups!
+2. Tap **Subscribe**, pick your billing period, then complete payment in Stripe
+3. Receive exclusive one-time invite links for VIP groups!
 
 *Subscription Management:*
-• **Monthly recurring billing** - Automatic renewal
-• **Cancel anytime** - Use /cancel command
-• **Access until period end** - No immediate cutoff
+• **Recurring billing** — Renews on your plan’s schedule until you cancel
+• **Cancel anytime** — Use Cancel subscription or /cancel
+• **Access until period end** — No immediate cutoff
 
 *VIP Groups:*
 • **Announcements Channel**: Daily picks and betting tips (one-time invite link)
@@ -322,7 +381,7 @@ class GCPTelegramBot:
 *Need Help?*
 Contact AM if you have any questions about your subscription.
 """
-        await update.message.reply_text(help_text, parse_mode="Markdown")
+        await update.effective_message.reply_text(help_text, parse_mode="Markdown")
 
     async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Create a test subscription for the user (development purposes)."""
@@ -513,7 +572,7 @@ Contact AM if you have any questions about your subscription.
             subscription = self.firestore_service.get_subscription(user_id)
             
             if not subscription or subscription.get('status') != 'active':
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     "❌ **No Active Subscription Found**\n\n"
                     "You don't have an active subscription to cancel.\n\n"
                     "Use /start to subscribe if you'd like to join VIP!"
@@ -524,7 +583,7 @@ Contact AM if you have any questions about your subscription.
             metadata = subscription.get('metadata', {})
             if metadata.get('cancelled'):
                 expiry_date = subscription.get('expiry_date')
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     f"⚠️ **Subscription Already Cancelled**\n\n"
                     f"Your subscription has already been cancelled and will expire on:\n"
                     f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
@@ -535,7 +594,7 @@ Contact AM if you have any questions about your subscription.
             # Get Stripe customer ID
             stripe_customer_id = subscription.get('stripe_customer_id')
             if not stripe_customer_id:
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     "❌ **Unable to Cancel Subscription**\n\n"
                     "We couldn't find your Stripe customer information. Please contact support for assistance."
                 )
@@ -552,7 +611,7 @@ Contact AM if you have any questions about your subscription.
                     subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='trialing')
                 
                 if not subscriptions.data:
-                    await update.message.reply_text(
+                    await update.effective_message.reply_text(
                         "❌ **No Active Stripe Subscription Found**\n\n"
                         "We couldn't find an active subscription in Stripe. Please contact support."
                     )
@@ -589,7 +648,7 @@ Contact AM if you have any questions about your subscription.
                 )
                 
                 if success:
-                    await update.message.reply_text(
+                    await update.effective_message.reply_text(
                         f"✅ **Subscription Cancelled Successfully**\n\n"
                         f"Your subscription has been cancelled and will expire on:\n"
                         f"**{expiry_str}**\n\n"
@@ -598,21 +657,145 @@ Contact AM if you have any questions about your subscription.
                     )
                     logger.info(f"User {user_id} cancelled their subscription")
                 else:
-                    await update.message.reply_text(
+                    await update.effective_message.reply_text(
                         "❌ **Error Cancelling Subscription**\n\n"
                         "There was an error updating your subscription status. Please contact support."
                     )
                 
             except Exception as e:
                 logger.error(f"Error cancelling Stripe subscription for user {user_id}: {e}")
-                await update.message.reply_text(
+                await update.effective_message.reply_text(
                     "❌ **Error Cancelling Subscription**\n\n"
                     "There was an error cancelling your subscription. Please contact support for assistance."
                 )
                 
         except Exception as e:
             logger.error(f"Error in cancel_command: {e}")
-            await update.message.reply_text(f"❌ Error processing cancellation request: {e}")
+            await update.effective_message.reply_text(f"❌ Error processing cancellation request: {e}")
+
+    async def _reply_stripe_checkout_error(self, query, user_id: int, e: Exception) -> None:
+        logger.error(
+            "Error creating subscription checkout",
+            extra={"telegram_id": user_id, "error": str(e)},
+            exc_info=True,
+        )
+        if isinstance(e, ActiveSubscriptionExistsError):
+            await query.message.reply_text(str(e))
+            return
+        dev = os.getenv("DEVELOPMENT_MODE", "false").lower() == "true"
+        msg = "❌ Sorry, there was an error processing your request. Please try again later."
+        if dev:
+            stripe_detail = (
+                (e.user_message or str(e)) if isinstance(e, StripeError) else str(e)
+            )
+            msg += f"\n\nDebug: {stripe_detail}"
+            if isinstance(e, StripeError) and (
+                getattr(e, "code", None) == "resource_missing"
+                or "No such price" in str(e)
+            ):
+                msg += (
+                    "\n\nLikely cause: **API key mode ≠ price mode**. "
+                    "`sk_test_` keys only work with prices from Stripe **Test mode**; "
+                    "**live** price IDs require `sk_live_` keys (and vice versa)."
+                )
+        await query.message.reply_text(msg)
+
+    async def _reply_subscription_checkout(
+        self,
+        query,
+        user_id: int,
+        username: str | None,
+        price_id: str | None,
+    ) -> None:
+        """Open Stripe checkout for the given price (or default monthly if price_id is None)."""
+        existing_subscription = self.firestore_service.get_subscription(user_id)
+        if existing_subscription and existing_subscription.get("status") == "active":
+            expiry_date = existing_subscription["expiry_date"]
+            await query.message.reply_text(
+                f"❌ **Subscription Already Active**\n\n"
+                f"You already have an active subscription that expires on:\n"
+                f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                f"You cannot subscribe again until your current subscription expires.\n\n"
+                f"Use `/status` to check your current subscription."
+            )
+            return
+
+        if not self.stripe_service.is_configured:
+            await query.message.reply_text(
+                "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
+                "For testing, you can use /test to create a test subscription."
+            )
+            return
+
+        try:
+            payment_url = self.stripe_service.create_subscription_checkout(
+                user_id, username, price_id=price_id
+            )
+            keyboard = [[InlineKeyboardButton("💳 Pay now", url=payment_url)]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_text(
+                self._subscription_checkout_message_text(),
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await self._reply_stripe_checkout_error(query, user_id, e)
+
+    async def _reply_subscription_checkouts_combined(
+        self,
+        query,
+        user_id: int,
+        username: str | None,
+        plans: List[Dict[str, str]],
+    ) -> None:
+        """Single message: intro text + one Stripe Checkout URL button per plan."""
+        existing_subscription = self.firestore_service.get_subscription(user_id)
+        if existing_subscription and existing_subscription.get("status") == "active":
+            expiry_date = existing_subscription["expiry_date"]
+            await query.message.reply_text(
+                f"❌ **Subscription Already Active**\n\n"
+                f"You already have an active subscription that expires on:\n"
+                f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                f"You cannot subscribe again until your current subscription expires.\n\n"
+                f"Use `/status` to check your current subscription."
+            )
+            return
+
+        if not self.stripe_service.is_configured:
+            await query.message.reply_text(
+                "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
+                "For testing, you can use /test to create a test subscription."
+            )
+            return
+
+        rows: list = []
+        first_error: Exception | None = None
+        for p in plans:
+            try:
+                url = self.stripe_service.create_subscription_checkout(
+                    user_id, username, price_id=p["price_id"]
+                )
+                rows.append([InlineKeyboardButton(f"💳 {p['label']}", url=url)])
+            except Exception as e:
+                if first_error is None:
+                    first_error = e
+                logger.error(
+                    "Checkout session failed for plan %s",
+                    p.get("key"),
+                    exc_info=True,
+                )
+
+        if not rows:
+            await self._reply_stripe_checkout_error(
+                query, user_id, first_error or Exception("Checkout unavailable")
+            )
+            return
+
+        await query.message.reply_text(
+            self._subscription_checkout_message_text(),
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode="Markdown",
+        )
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button callbacks."""
@@ -623,13 +806,40 @@ Contact AM if you have any questions about your subscription.
         
         query = update.callback_query
         await query.answer()
-        
-        if query.data == "subscribe":
-            # Check if user already has an active subscription
+        data = query.data
+
+        if data == "menu_status":
+            await self._send_status_reply(update, update.effective_user.id)
+            return
+        if data == "menu_help":
+            await self._send_help_reply(update)
+            return
+        if data == "menu_cancel":
+            await self.cancel_command(update, context)
+            return
+        if data == "menu_chatinfo":
+            await self.get_chat_info(update, context)
+            return
+
+        if data.startswith("subscribe_plan:"):
+            plan_key = data.split(":", 1)[1]
+            price_id = self.stripe_service.price_id_for_plan_key(plan_key)
+            if not price_id:
+                await query.message.reply_text(
+                    "That plan is not available. Please use /start and try Subscribe again."
+                )
+                return
             user_id = update.effective_user.id
+            username = update.effective_user.username
+            await self._reply_subscription_checkout(query, user_id, username, price_id)
+            return
+
+        if data == "subscribe":
+            user_id = update.effective_user.id
+            username = update.effective_user.username
             existing_subscription = self.firestore_service.get_subscription(user_id)
-            if existing_subscription and existing_subscription.get('status') == 'active':
-                expiry_date = existing_subscription['expiry_date']
+            if existing_subscription and existing_subscription.get("status") == "active":
+                expiry_date = existing_subscription["expiry_date"]
                 await query.message.reply_text(
                     f"❌ **Subscription Already Active**\n\n"
                     f"You already have an active subscription that expires on:\n"
@@ -638,51 +848,19 @@ Contact AM if you have any questions about your subscription.
                     f"Use `/status` to check your current subscription."
                 )
                 return
-            
-            # Check if Stripe is configured
-            if self.stripe_service.is_configured:
-                try:
-                    # Get user information
-                    user_id = update.effective_user.id
-                    username = update.effective_user.username
-                    
-                    # Create subscription checkout (recurring billing)
-                    payment_url = self.stripe_service.create_subscription_checkout(user_id, username)
-                    
-                    # Send payment link to user
-                    keyboard = [
-                        [InlineKeyboardButton("💳 Pay Now", url=payment_url)],
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    
-                    await query.message.reply_text(
-                        "🎉 Ready to subscribe!\n\n"
-                        "Click the button below to complete your payment securely through Stripe.\n\n"
-                        "✅ Secure payment processing\n"
-                        "✅ Instant activation\n"
-                        "✅ Monthly recurring subscription\n"
-                        "✅ Auto-renewal (cancel anytime)",
-                        reply_markup=reply_markup
-                    )
-                    
-                except Exception as e:
-                    user_id = update.effective_user.id
-                    logger.error(
-                        "Error creating subscription checkout - user sees generic message",
-                        extra={"telegram_id": user_id, "error": str(e)},
-                        exc_info=True
-                    )
-                    await query.message.reply_text(
-                        "❌ Sorry, there was an error processing your request. Please try again later."
-                    )
-            else:
-                # Stripe not configured - show message like original bot
-                await query.message.reply_text(
-                    "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
-                    "For testing, you can use /test to create a test subscription."
+
+            plans = self.stripe_service.get_subscription_plan_options()
+            if len(plans) > 1:
+                await self._reply_subscription_checkouts_combined(
+                    query, user_id, username, plans
                 )
+                return
+
+            single_price = plans[0]["price_id"] if plans else None
+            await self._reply_subscription_checkout(query, user_id, username, single_price)
+            return
         
-        elif query.data == "free_trial":
+        if data == "free_trial":
             # Check if user already has an active subscription or trial
             user_id = update.effective_user.id
             username = update.effective_user.username or "Unknown"
@@ -732,6 +910,7 @@ Contact AM if you have any questions about your subscription.
                         "✅ **No charges** during trial period\n\n"
                         "After 3 days, your subscription will automatically continue at the regular price. "
                         "You can cancel anytime before the trial ends to avoid charges.\n\n"
+                        "Subscription fees are non-refundable; cancel anytime to stop future charges.\n\n"
                         "⚠️ **Note:** You'll need to add a payment method to start the trial, but you won't be charged until after 3 days.",
                         reply_markup=reply_markup
                     )
@@ -821,7 +1000,7 @@ Contact AM if you have any questions about your subscription.
         if chat.username:
             info_message += f"**Username:** @{chat.username}\n"
         
-        await update.message.reply_text(info_message, parse_mode="Markdown")
+        await update.effective_message.reply_text(info_message, parse_mode="Markdown")
         logger.info(f"Chat info requested for chat '{chat_title}' (ID: {chat_id})")
 
     async def check_expired_subscriptions(self, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -926,7 +1105,13 @@ Contact AM if you have any questions about your subscription.
                 invite_links['announcements'] = invite_link.invite_link
                 logger.info(f"Generated one-time invite link for announcements group for user {user_id}")
             except Exception as e:
-                logger.error(f"Failed to generate invite link for announcements group: {e}")
+                logger.error(
+                    "VIP_INVITE_LINKS: create_chat_invite_link failed for announcements user_id=%s chat_id=%s: %s",
+                    user_id,
+                    self.vip_announcements_id,
+                    e,
+                    exc_info=True,
+                )
         
         # Generate invite link for VIP discussion group (if configured)
         if self.vip_discussion_id:
@@ -941,7 +1126,41 @@ Contact AM if you have any questions about your subscription.
                 invite_links['discussion'] = invite_link.invite_link
                 logger.info(f"Generated one-time invite link for discussion group for user {user_id}")
             except Exception as e:
-                logger.error(f"Failed to generate invite link for discussion group: {e}")
+                logger.error(
+                    "VIP_INVITE_LINKS: create_chat_invite_link failed for discussion user_id=%s chat_id=%s: %s",
+                    user_id,
+                    self.vip_discussion_id,
+                    e,
+                    exc_info=True,
+                )
+        
+        configured = []
+        if self.vip_announcements_id:
+            configured.append("announcements")
+        if self.vip_discussion_id:
+            configured.append("discussion")
+        if not configured:
+            logger.warning(
+                "VIP_INVITE_LINKS: no VIP chat IDs configured (secrets vip-announcements-id / vip-chat-id); user_id=%s",
+                user_id,
+            )
+        else:
+            got = list(invite_links.keys())
+            if not invite_links:
+                logger.error(
+                    "VIP_INVITE_LINKS: all invite generations failed user_id=%s username=%s expected=%s",
+                    user_id,
+                    username or "",
+                    configured,
+                )
+            elif set(got) != set(configured):
+                logger.error(
+                    "VIP_INVITE_LINKS: partial failure user_id=%s username=%s expected=%s got=%s",
+                    user_id,
+                    username or "",
+                    configured,
+                    got,
+                )
         
         return invite_links
 
@@ -982,15 +1201,30 @@ Contact AM if you have any questions about your subscription.
             logger.info(f"Sent VIP invite links to user {username} (ID: {user_id})")
             
         except Exception as e:
-            logger.error(f"Failed to send VIP invite links to user {user_id}: {e}")
+            logger.error(
+                "VIP_INVITE_LINKS: send_message failed user_id=%s username=%s: %s",
+                user_id,
+                username or "",
+                e,
+                exc_info=True,
+            )
             # Fallback message without Markdown
             try:
                 await self.application.bot.send_message(
                     chat_id=user_id,
                     text="🎉 Welcome to AMBetz VIP! Your subscription is active. Please contact AM for your invite links."
                 )
+                logger.warning(
+                    "VIP_INVITE_LINKS: sent contact-admin fallback after send failure user_id=%s",
+                    user_id,
+                )
             except Exception as fallback_error:
-                logger.error(f"Failed to send fallback message: {fallback_error}")
+                logger.error(
+                    "VIP_INVITE_LINKS: fallback send_message also failed user_id=%s: %s",
+                    user_id,
+                    fallback_error,
+                    exc_info=True,
+                )
 
     def setup_application(self) -> Application:
         """Setup and configure the Telegram application"""
@@ -1062,6 +1296,12 @@ def main():
         
         # Run the bot - run_polling is synchronous and handles its own event loop
         if bot.application:
+            logger.warning(
+                "Starting local POLLING. Telegram allows only webhook OR polling for this bot token — "
+                "polling removes your registered webhook. If this token is used in production (Cloud Run), "
+                "production will stop receiving updates until you call setWebhook again for your service URL. "
+                "For local work, prefer DEVELOPMENT_MODE=true and a separate test bot token from @BotFather."
+            )
             logger.info("Starting bot in polling mode...")
             bot.application.run_polling(
                 allowed_updates=["message", "callback_query"],

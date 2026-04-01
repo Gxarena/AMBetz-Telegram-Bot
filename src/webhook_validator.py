@@ -6,6 +6,8 @@ import logging
 from typing import Optional, Dict, Any
 import stripe
 
+from stripe_compat import metadata_get
+
 logger = logging.getLogger(__name__)
 
 class WebhookValidator:
@@ -33,7 +35,7 @@ class WebhookValidator:
             # Check for required bot metadata
             required_fields = ['telegram_id', 'source']
             for field in required_fields:
-                if field not in session.metadata:
+                if metadata_get(session.metadata, field) in (None, ""):
                     return {
                         'valid': False,
                         'error': f'Missing required field: {field}',
@@ -41,16 +43,16 @@ class WebhookValidator:
                     }
             
             # Validate source is from bot
-            if session.metadata.get('source') != 'gcp-bot':
+            if metadata_get(session.metadata, "source") != 'gcp-bot':
                 return {
                     'valid': False,
-                    'error': f'Invalid source: {session.metadata.get("source")}',
+                    'error': f'Invalid source: {metadata_get(session.metadata, "source")}',
                     'action': 'reject_payment'
                 }
             
             # Validate telegram_id is numeric
             try:
-                telegram_id = int(session.metadata.get('telegram_id'))
+                telegram_id = int(metadata_get(session.metadata, "telegram_id"))
                 if telegram_id <= 0:
                     return {
                         'valid': False,
@@ -68,7 +70,7 @@ class WebhookValidator:
             if session.customer:
                 try:
                     customer = stripe.Customer.retrieve(session.customer)
-                    if not customer.metadata.get('telegram_id'):
+                    if not metadata_get(customer.metadata, "telegram_id"):
                         return {
                             'valid': False,
                             'error': 'Customer not created through bot (no telegram_id)',
@@ -76,7 +78,9 @@ class WebhookValidator:
                         }
                     
                     # Ensure customer telegram_id matches session telegram_id
-                    if customer.metadata.get('telegram_id') != session.metadata.get('telegram_id'):
+                    if metadata_get(customer.metadata, "telegram_id") != metadata_get(
+                        session.metadata, "telegram_id"
+                    ):
                         return {
                             'valid': False,
                             'error': 'Customer telegram_id mismatch',
@@ -94,8 +98,8 @@ class WebhookValidator:
             # All validations passed
             return {
                 'valid': True,
-                'telegram_id': int(session.metadata.get('telegram_id')),
-                'source': session.metadata.get('source')
+                'telegram_id': int(metadata_get(session.metadata, "telegram_id")),
+                'source': metadata_get(session.metadata, "source"),
             }
             
         except Exception as e:
@@ -118,7 +122,7 @@ class WebhookValidator:
             customer = stripe.Customer.retrieve(subscription.customer)
             
             # Check if customer has telegram_id
-            if not customer.metadata.get('telegram_id'):
+            if not metadata_get(customer.metadata, "telegram_id"):
                 return {
                     'valid': False,
                     'error': 'Customer not created through bot (no telegram_id)',
@@ -127,7 +131,7 @@ class WebhookValidator:
             
             # Validate telegram_id is numeric
             try:
-                telegram_id = int(customer.metadata.get('telegram_id'))
+                telegram_id = int(metadata_get(customer.metadata, "telegram_id"))
                 if telegram_id <= 0:
                     return {
                         'valid': False,

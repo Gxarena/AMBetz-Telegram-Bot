@@ -95,8 +95,10 @@ def _subscription_period_end_unix(sub: Any) -> Optional[int]:
     top = _stripe_object_int(sub, "current_period_end")
     if top is not None:
         return top
-    items_obj = getattr(sub, "items", None)
-    data = getattr(items_obj, "data", None) if items_obj is not None else None
+    items_obj = sub.get("items") if hasattr(sub, "get") else None
+    data = None
+    if items_obj is not None:
+        data = items_obj.get("data") if hasattr(items_obj, "get") else getattr(items_obj, "data", None)
     if not data:
         return None
     best: Optional[int] = None

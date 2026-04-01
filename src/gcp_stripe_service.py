@@ -1,8 +1,12 @@
 import stripe
 import os
 import logging
+
+from stripe_compat import metadata_get
+import time
 import pytz
 from typing import Any, Dict, List, Optional, Tuple
+from calendar import monthrange
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
 
@@ -10,10 +14,19 @@ from google.cloud import secretmanager
 logger = logging.getLogger(__name__)
 
 
+class ActiveSubscriptionExistsError(ValueError):
+    """Raised when Stripe already has a subscription that blocks creating a new paid checkout."""
+
+    pass
+
+
 def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[int]]:
     """
     current_period_start/end on Subscription, or from first line item if Stripe omits top-level
     (common with current API shapes).
+
+    Note: Subscription is a StripeObject (dict subclass). Use sub["items"], not sub.items —
+    the latter is dict.items() and breaks line-item period reads.
     """
     try:
         cs = getattr(sub, "current_period_start", None)
@@ -22,19 +35,120 @@ def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[
             return int(cs), int(ce)
     except (TypeError, ValueError):
         pass
-    items = getattr(sub, "items", None)
-    data = getattr(items, "data", None) if items is not None else None
+    items_obj = sub.get("items") if hasattr(sub, "get") else None
+    data = None
+    if items_obj is not None:
+        data = items_obj.get("data") if hasattr(items_obj, "get") else getattr(items_obj, "data", None)
     if not data:
         return None, None
-    it0 = data[0]
-    try:
-        cs = getattr(it0, "current_period_start", None)
-        ce = getattr(it0, "current_period_end", None)
-        if cs is not None and ce is not None:
-            return int(cs), int(ce)
-    except (TypeError, ValueError, IndexError):
-        pass
+    for it0 in data:
+        try:
+            cs = it0.get("current_period_start") if hasattr(it0, "get") else getattr(it0, "current_period_start", None)
+            ce = it0.get("current_period_end") if hasattr(it0, "get") else getattr(it0, "current_period_end", None)
+            if cs is not None and ce is not None:
+                return int(cs), int(ce)
+        except (TypeError, ValueError, IndexError):
+            continue
     return None, None
+
+
+def _sget(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    try:
+        return obj[key]
+    except (KeyError, TypeError):
+        pass
+    try:
+        return getattr(obj, key)
+    except AttributeError:
+        return None
+
+
+def _add_calendar_months(dt: datetime, months: int) -> datetime:
+    if months <= 0:
+        return dt
+    y, m, d = dt.year, dt.month, dt.day
+    total_m = m - 1 + months
+    y += total_m // 12
+    m = total_m % 12 + 1
+    last = monthrange(y, m)[1]
+    d = min(d, last)
+    return dt.replace(year=y, month=m, day=d)
+
+
+def _expiry_from_recurring_start(
+    start: datetime, interval: str, interval_count: int
+) -> datetime:
+    n = max(1, interval_count)
+    iv = (interval or "").lower()
+    if iv == "day":
+        return start + timedelta(days=n)
+    if iv == "week":
+        return start + timedelta(weeks=n)
+    if iv == "month":
+        return _add_calendar_months(start, n)
+    if iv == "year":
+        return _add_calendar_months(start, 12 * n)
+    return start + timedelta(days=30)
+
+
+def subscription_fallback_expiry(
+    subscription: Any,
+    start_date: datetime,
+    *,
+    is_trial: bool = False,
+) -> datetime:
+    """
+    When current_period_start/end are missing: use first line item's price.recurring
+    (day/week/month/year × interval_count). Trial → +3 days. If price not expanded
+    or no recurring, +30 days.
+    Retrieve subscriptions with expand=['items.data', 'items.data.price'].
+    """
+    if is_trial:
+        return start_date + timedelta(days=3)
+
+    items_obj = subscription.get("items") if hasattr(subscription, "get") else None
+    data = None
+    if items_obj is not None:
+        data = (
+            items_obj.get("data")
+            if hasattr(items_obj, "get")
+            else getattr(items_obj, "data", None)
+        )
+    if not data:
+        return start_date + timedelta(days=30)
+
+    price = _sget(data[0], "price")
+    if isinstance(price, str):
+        return start_date + timedelta(days=30)
+
+    rec = _sget(price, "recurring")
+    if not rec:
+        return start_date + timedelta(days=30)
+
+    interval = _sget(rec, "interval")
+    ic_raw = _sget(rec, "interval_count")
+    try:
+        ic = int(ic_raw) if ic_raw is not None else 1
+    except (TypeError, ValueError):
+        ic = 1
+
+    if not interval:
+        return start_date + timedelta(days=30)
+
+    try:
+        return _expiry_from_recurring_start(start_date, str(interval), ic)
+    except Exception as exc:
+        logger.warning(
+            "subscription_fallback_expiry: interval=%s count=%s: %s",
+            interval,
+            ic,
+            exc,
+        )
+        return start_date + timedelta(days=30)
 
 
 def _list_subscriptions_paginated(customer_id: str, status: str) -> List[Any]:
@@ -65,15 +179,49 @@ class GCPStripeService:
         self.secret_key = self._get_secret("stripe-secret-key")
         self.webhook_secret = self._get_secret("stripe-webhook-secret")
         self.price_id = self._get_secret("stripe-price-id")
+        # Optional shorter billing periods (same Stripe product, different recurring prices)
+        self.price_id_week = (self._get_secret("stripe-price-id-week") or "").strip()
+        self.price_id_2week = (self._get_secret("stripe-price-id-2week") or "").strip()
         
         # Check if Stripe is configured
         self.is_configured = bool(self.secret_key)
         
         if self.is_configured:
             stripe.api_key = self.secret_key
-            logger.info("GCP Stripe service initialized with Secret Manager")
+            _plans = self.get_subscription_plan_options()
+            logger.info(
+                "GCP Stripe service initialized; subscription plan keys for checkout: %s (%d plan(s))",
+                [p["key"] for p in _plans],
+                len(_plans),
+            )
         else:
             logger.warning("Stripe not configured - payment features will be disabled")
+
+    def get_subscription_plan_options(self) -> List[Dict[str, str]]:
+        """
+        Plans shown in the bot after the user taps Subscribe.
+        Keys: week, 2week, month — must match callback_data subscribe_plan:<key>.
+        """
+        plans: List[Dict[str, str]] = []
+        if self.price_id_week:
+            plans.append(
+                {"key": "week", "price_id": self.price_id_week, "label": "1 week — $35"}
+            )
+        if self.price_id_2week:
+            plans.append(
+                {"key": "2week", "price_id": self.price_id_2week, "label": "2 weeks — $50"}
+            )
+        if self.price_id:
+            plans.append(
+                {"key": "month", "price_id": self.price_id, "label": "1 month — $75"}
+            )
+        return plans
+
+    def price_id_for_plan_key(self, plan_key: str) -> Optional[str]:
+        for p in self.get_subscription_plan_options():
+            if p["key"] == plan_key:
+                return p["price_id"]
+        return None
 
     def cancel_terminal_and_incomplete_subscriptions(self, customer_id: str) -> int:
         """
@@ -123,30 +271,140 @@ class GCPStripeService:
                     logger.error("Failed to cancel subscription %s: %s", sub.id, exc)
         return cancelled
 
-    def _get_secret(self, secret_name: str) -> str:
-        """Get secret from GCP Secret Manager"""
+    def _ensure_paid_subscription_checkout_allowed(self, customer_id: str) -> None:
+        """
+        Paid plan checkout must not run while the customer is still in trialing — otherwise Stripe
+        would create a second subscription (bot UI should also block this).
+        Active subscriptions are already rejected inside get_or_create_customer.
+        """
+        now_ts = int(time.time())
+        trialing = stripe.Subscription.list(customer=customer_id, status="trialing")
+        for sub in trialing.data or []:
+            _, period_end = _subscription_period_bounds_unix(sub)
+            if period_end is None or period_end > now_ts:
+                raise ActiveSubscriptionExistsError(
+                    "You already have a trial or trialing subscription. Wait for it to convert, "
+                    "or cancel it in the customer portal before buying a plan."
+                )
+
+    def expire_open_checkout_sessions_for_customer(self, customer_id: str) -> int:
+        """
+        Invalidate any other open Checkout sessions for this customer so old links cannot be paid.
+        Safe to call after a subscription successfully starts (the completed session is not 'open').
+        """
+        if not customer_id or not self.is_configured:
+            return 0
+        n = 0
         try:
-            # Check if we're in test mode and use test secrets
-            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
-                secret_name = f"{secret_name}-test"
-            
-            # Build the resource name of the secret version
+            sessions = stripe.checkout.Session.list(
+                customer=customer_id, status="open", limit=100
+            )
+            for s in sessions.auto_paging_iter():
+                try:
+                    stripe.checkout.Session.expire(s.id)
+                    n += 1
+                    logger.info(
+                        "Expired open checkout session %s for customer %s", s.id, customer_id
+                    )
+                except stripe.InvalidRequestError as exc:
+                    err = str(exc).lower()
+                    if (
+                        "not in open status" in err
+                        or "already completed" in err
+                        or "cannot expire" in err
+                    ):
+                        continue
+                    logger.warning("Could not expire session %s: %s", s.id, exc)
+                except stripe.StripeError as exc:
+                    logger.warning("Could not expire session %s: %s", s.id, exc)
+        except stripe.StripeError as exc:
+            logger.error("expire_open_checkout_sessions_for_customer list failed: %s", exc)
+        return n
+
+    def revert_duplicate_active_checkout(self, session) -> None:
+        """
+        Cancel the subscription created by this Checkout session only (no refund).
+
+        Used when the user already had an active VIP but completed another Checkout anyway.
+        We do not refund: duplicate checkouts in that situation are treated like policy elsewhere
+        (final sale / no refunds). Must run *before* handle_successful_payment — that path calls
+        cancel_other_subscriptions_except and would cancel their legitimate subscription first.
+        """
+        sub_id = getattr(session, "subscription", None)
+        if not sub_id and isinstance(session, dict):
+            sub_id = session.get("subscription")
+        if not sub_id:
+            logger.warning(
+                "revert_duplicate_active_checkout: no subscription on session %s",
+                getattr(session, "id", "?"),
+            )
+            return
+        sid = getattr(session, "id", None) or (session.get("id") if isinstance(session, dict) else None)
+        try:
+            sub = stripe.Subscription.retrieve(sub_id)
+            if getattr(sub, "status", None) in ("canceled", "incomplete_expired"):
+                logger.info(
+                    "Duplicate revert: subscription %s already %s (skip cancel)",
+                    sub_id,
+                    sub.status,
+                )
+            else:
+                stripe.Subscription.cancel(sub_id)
+                logger.info(
+                    "Cancelled duplicate subscription %s from checkout session %s",
+                    sub_id,
+                    sid,
+                )
+        except stripe.StripeError as exc:
+            logger.error("Failed to cancel duplicate subscription %s: %s", sub_id, exc)
+
+    def _env_lookup_for_secret_id(self, secret_name: str) -> str:
+        """Map Secret Manager id (e.g. stripe-secret-key-test) to env vars."""
+        key = secret_name.upper().replace("-", "_")
+        val = os.getenv(key)
+        if val:
+            return val
+        if os.getenv("DEVELOPMENT_MODE", "false").lower() == "true" and secret_name.endswith("-test"):
+            base = secret_name[: -len("-test")]
+            val2 = os.getenv(base.upper().replace("-", "_"))
+            if val2:
+                return val2
+        return ""
+
+    def _get_secret(self, secret_name: str) -> str:
+        """Get secret from GCP Secret Manager, with optional .env preference for Stripe (local dev)."""
+        original_name = secret_name
+        if os.getenv("DEVELOPMENT_MODE", "false").lower() == "true":
+            secret_name = f"{secret_name}-test"
+
+        # GCP may still hold sk_test_* while .env has sk_live_* — Secret Manager wins unless:
+        if (
+            os.getenv("STRIPE_PREFER_DOTENV", "").lower() in ("1", "true", "yes")
+            and original_name.startswith("stripe-")
+        ):
+            v = self._env_lookup_for_secret_id(secret_name)
+            if v:
+                logger.info(
+                    "STRIPE_PREFER_DOTENV: using Stripe value from environment for %s",
+                    original_name,
+                )
+                return v
+
+        try:
             name = f"projects/{self.project_id}/secrets/{secret_name}/versions/latest"
-            
-            # Access the secret version
             response = self.secret_client.access_secret_version(request={"name": name})
-            
-            # Return the decoded payload
             return response.payload.data.decode("UTF-8")
         except Exception as e:
             logger.error(f"Error accessing secret {secret_name}: {e}")
-            # Fallback to environment variables for development
-            return os.getenv(secret_name.upper().replace('-', '_'))
-    
-    def create_payment_link(self, telegram_id: int, telegram_username: str = None) -> str:
+            return self._env_lookup_for_secret_id(secret_name) or ""
+
+    def create_payment_link(self, telegram_id: int, telegram_username: str = None, price_id: str = None) -> str:
         """Create a Stripe payment link for a user"""
         if not self.is_configured:
             raise ValueError("Stripe is not configured")
+        pid = price_id or self.price_id
+        if not pid:
+            raise ValueError("No Stripe price ID configured")
             
         try:
             # Create or retrieve customer
@@ -157,7 +415,7 @@ class GCPStripeService:
             payment_link = stripe.PaymentLink.create(
                 line_items=[
                     {
-                        "price": self.price_id,
+                        "price": pid,
                         "quantity": 1,
                     },
                 ],
@@ -175,10 +433,13 @@ class GCPStripeService:
             logger.error(f"Error creating payment link: {e}")
             raise
 
-    def create_subscription_checkout(self, telegram_id: int, telegram_username: str = None) -> str:
+    def create_subscription_checkout(self, telegram_id: int, telegram_username: str = None, price_id: str = None) -> str:
         """Create a Stripe checkout session for recurring subscription"""
         if not self.is_configured:
             raise ValueError("Stripe is not configured")
+        pid = price_id or self.price_id
+        if not pid:
+            raise ValueError("No Stripe price ID configured")
             
         try:
             # Sanitize username to remove problematic Unicode characters
@@ -187,6 +448,7 @@ class GCPStripeService:
             # Create or retrieve customer
             customer = self.get_or_create_customer(telegram_id, sanitized_username)
             self.cancel_terminal_and_incomplete_subscriptions(customer.id)
+            self._ensure_paid_subscription_checkout_allowed(customer.id)
 
             # Create checkout session for subscription
             checkout_session = stripe.checkout.Session.create(
@@ -194,7 +456,7 @@ class GCPStripeService:
                 payment_method_types=['card'],
                 line_items=[
                     {
-                        'price': self.price_id,
+                        'price': pid,
                         'quantity': 1,
                     },
                 ],
@@ -285,7 +547,6 @@ class GCPStripeService:
                 # Check for active (non-trial) subscriptions that are not already ended
                 # Allow resubscribe if all "active" subs have current_period_end in the past
                 # (Stripe can still list them as active briefly before subscription.deleted fires)
-                import time
                 now_ts = int(time.time())
                 truly_active = []
                 for sub in (active_subscriptions.data or []):
@@ -297,7 +558,9 @@ class GCPStripeService:
                 if truly_active:
                     # Customer has a real active subscription - block duplicate
                     logger.warning(f"Customer {customer_id} already has active subscription, rejecting new subscription attempt")
-                    raise ValueError(f"Customer already has an active subscription. This should have been caught by the bot.")
+                    raise ActiveSubscriptionExistsError(
+                        "You already have an active paid subscription. Use /status to see when it renews."
+                    )
                 
                 # Allow trialing subscriptions (user might be starting a new trial or converting trial to paid)
                 # The bot logic will handle preventing duplicate trials
@@ -406,18 +669,8 @@ class GCPStripeService:
             
             telegram_id = None
             try:
-                if isinstance(metadata, dict):
-                    telegram_id = metadata.get("telegram_id")
-                    logger.info(f"Telegram ID from dict.get(): {telegram_id}")
-                elif hasattr(metadata, 'get'):
-                    telegram_id = metadata.get("telegram_id")
-                    logger.info(f"Telegram ID from object.get(): {telegram_id}")
-                elif hasattr(metadata, 'telegram_id'):
-                    telegram_id = getattr(metadata, 'telegram_id', None)
-                    logger.info(f"Telegram ID from getattr(): {telegram_id}")
-                else:
-                    logger.warning(f"Metadata is neither dict nor object with get/telegram_id: {type(metadata)}")
-                    telegram_id = None
+                telegram_id = metadata_get(metadata, "telegram_id")
+                logger.info(f"Telegram ID from metadata: {telegram_id}")
             except Exception as e:
                 logger.error(f"Error accessing telegram_id from metadata: {e}")
                 logger.error(f"Metadata type: {type(metadata)}")
@@ -439,7 +692,7 @@ class GCPStripeService:
                     try:
                         # Retrieve customer from Stripe to get metadata
                         customer = stripe.Customer.retrieve(customer_id)
-                        telegram_id = customer.metadata.get('telegram_id')
+                        telegram_id = metadata_get(customer.metadata, "telegram_id")
                         logger.info(f"Retrieved telegram_id from customer metadata: {telegram_id}")
                     except Exception as e:
                         logger.error(f"Error retrieving customer {customer_id}: {e}")
@@ -501,17 +754,10 @@ class GCPStripeService:
             if hasattr(session_data, 'subscription') and session_data.subscription:
                 subscription_object = stripe.Subscription.retrieve(
                     session_data.subscription,
-                    expand=["items.data"],
+                    expand=["items.data", "items.data.price"],
                 )
 
-                meta_is_trial = False
-                if isinstance(metadata, dict):
-                    meta_is_trial = metadata.get("is_trial") == "true"
-                elif metadata is not None:
-                    try:
-                        meta_is_trial = metadata["is_trial"] == "true"
-                    except Exception:
-                        pass
+                meta_is_trial = metadata_get(metadata, "is_trial") == "true"
                 is_trial = (
                     subscription_object.status == "trialing" or meta_is_trial
                 )
@@ -535,13 +781,15 @@ class GCPStripeService:
                     )
                 elif getattr(subscription_object, "created", None):
                     logger.warning(
-                        "Subscription %s missing period bounds, using created + default window",
+                        "Subscription %s missing period bounds, using created + recurring/trial fallback",
                         subscription_object.id,
                     )
                     start_date = datetime.fromtimestamp(
                         subscription_object.created, tz=pytz.UTC
                     )
-                    expiry_date = start_date + timedelta(days=3 if is_trial else 30)
+                    expiry_date = subscription_fallback_expiry(
+                        subscription_object, start_date, is_trial=is_trial
+                    )
                 else:
                     raise ValueError(
                         f"Subscription {subscription_object.id} has no date information available"
