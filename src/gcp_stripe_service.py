@@ -110,12 +110,21 @@ def _plan_label_from_stripe_price_id(price_id: str) -> Optional[str]:
         return None
     try:
         pr = stripe.Price.retrieve(str(price_id))
-    except Exception:
+    except Exception as e:
+        logger.info(
+            "plan_display: Price.retrieve(%s) failed (no API fallback label): %s",
+            price_id,
+            e,
+        )
         return None
     rec = getattr(pr, "recurring", None)
     if rec is None and hasattr(pr, "get"):
         rec = pr.get("recurring")
     if not rec:
+        logger.info(
+            "plan_display: Price %s has no recurring field (cannot label from interval)",
+            price_id,
+        )
         return None
     interval = getattr(rec, "interval", None)
     if interval is None and isinstance(rec, dict):
@@ -829,51 +838,116 @@ class GCPStripeService:
             )
             return False
 
-    def plan_display_for_subscription_doc(self, doc: Optional[Dict[str, Any]]) -> str:
+    def plan_display_for_subscription_doc(
+        self, doc: Optional[Dict[str, Any]], telegram_id: Optional[int] = None
+    ) -> str:
         """
         Human-readable plan for /status: 1 week, 2 weeks, 1 month, free trial, etc.
         Uses stored stripe_price_id when present; otherwise resolves from Stripe if possible.
         """
+        log_pfx = (
+            f"[plan_display telegram_id={telegram_id}]"
+            if telegram_id is not None
+            else "[plan_display]"
+        )
+
         if not doc:
+            logger.info("%s no doc -> em dash", log_pfx)
             return "—"
         meta = doc.get("metadata") or {}
         if isinstance(meta, dict) and meta.get("is_trial"):
+            logger.info("%s metadata.is_trial -> Free trial", log_pfx)
             return "Free trial"
         st = (doc.get("subscription_type") or "").lower()
         if st == "trial":
+            logger.info("%s subscription_type trial -> Free trial", log_pfx)
             return "Free trial"
 
         pid = doc.get("stripe_price_id")
-        if not pid and self.is_configured and doc.get("stripe_subscription_id"):
+        sub_id = doc.get("stripe_subscription_id")
+        logger.info(
+            "%s inputs: stripe_price_id=%r stripe_subscription_id=%r "
+            "subscription_type=%r status=%r stripe_service.is_configured=%s",
+            log_pfx,
+            pid,
+            sub_id,
+            st,
+            doc.get("status"),
+            self.is_configured,
+        )
+
+        if not pid and self.is_configured and sub_id:
             try:
                 sub = stripe.Subscription.retrieve(
-                    str(doc["stripe_subscription_id"]),
+                    str(sub_id),
                     expand=["items.data.price"],
                 )
                 pid = _price_id_from_stripe_subscription(sub)
-            except Exception:
+                logger.info(
+                    "%s Subscription.retrieve(%r) ok; resolved_price_id=%r",
+                    log_pfx,
+                    sub_id,
+                    pid,
+                )
+            except Exception as e:
+                logger.warning(
+                    "%s Subscription.retrieve(%r) failed: %s",
+                    log_pfx,
+                    sub_id,
+                    e,
+                    exc_info=True,
+                )
                 pid = None
+        elif not pid:
+            logger.info(
+                "%s skip Stripe retrieve: need is_configured=%s and stripe_subscription_id=%r",
+                log_pfx,
+                self.is_configured,
+                sub_id,
+            )
 
         if pid:
-            for p in self.get_subscription_plan_options():
+            opts = self.get_subscription_plan_options()
+            configured = [(p.get("key"), p.get("price_id")) for p in opts]
+            logger.info("%s matching price_id=%r against configured=%s", log_pfx, pid, configured)
+            for p in opts:
                 if p["price_id"] == pid:
                     key = p["key"]
                     if key == "week":
+                        logger.info("%s secret match -> 1 week", log_pfx)
                         return "1 week"
                     if key == "2week":
+                        logger.info("%s secret match -> 2 weeks", log_pfx)
                         return "2 weeks"
                     if key == "month":
+                        logger.info("%s secret match -> 1 month", log_pfx)
                         return "1 month"
             api_label = _plan_label_from_stripe_price_id(str(pid))
+            logger.info(
+                "%s no secret match; Stripe Price API label=%r for price_id=%r",
+                log_pfx,
+                api_label,
+                pid,
+            )
             if api_label:
                 return api_label
+            logger.info("%s fallback label -> Premium (recurring)", log_pfx)
             return "Premium (recurring)"
 
+        logger.info(
+            "%s no price_id after Firestore + retrieve; subscription_type=%r -> generic label path",
+            log_pfx,
+            st,
+        )
         if st == "premium":
+            logger.info("%s -> Premium (no stripe price id resolved)", log_pfx)
             return "Premium"
         if st == "test":
+            logger.info("%s -> Test", log_pfx)
             return "Test"
-        return st.title() if st else "Unknown"
+        out = st.title() if st else "Unknown"
+        logger.info("%s -> %r", log_pfx, out)
+        return out
     
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """Verify webhook signature from Stripe"""

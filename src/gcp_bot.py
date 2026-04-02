@@ -253,7 +253,9 @@ class GCPTelegramBot:
             start_date = subscription.get("start_date")
             expiry_date = subscription.get("expiry_date")
             status = subscription.get("status", "unknown")
-            plan_label = self.stripe_service.plan_display_for_subscription_doc(subscription)
+            plan_label = self.stripe_service.plan_display_for_subscription_doc(
+                subscription, telegram_id=user_id
+            )
 
             start_str = start_date.strftime("%Y-%m-%d %H:%M:%S") if start_date else "N/A"
             expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S") if expiry_date else "N/A"
