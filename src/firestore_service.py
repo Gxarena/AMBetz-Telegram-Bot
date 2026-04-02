@@ -122,6 +122,7 @@ class FirestoreService:
                            stripe_customer_id: str = None,
                            stripe_session_id: str = None,
                            stripe_subscription_id: str = None,
+                           stripe_price_id: str = None,
                            amount_paid: float = None,
                            currency: str = None) -> bool:
         """
@@ -160,6 +161,8 @@ class FirestoreService:
                 subscription_data['stripe_session_id'] = stripe_session_id
             if stripe_subscription_id:
                 subscription_data['stripe_subscription_id'] = stripe_subscription_id
+            if stripe_price_id:
+                subscription_data['stripe_price_id'] = stripe_price_id
             if amount_paid is not None:
                 subscription_data['amount_paid'] = amount_paid
             if currency:
@@ -292,6 +295,7 @@ class FirestoreService:
         expiry_date: datetime,
         stripe_customer_id: str,
         stripe_subscription_id: str,
+        stripe_price_id: Optional[str] = None,
     ) -> bool:
         """
         Merge-update billing fields from Stripe (source of truth) without wiping
@@ -301,16 +305,17 @@ class FirestoreService:
             doc_ref = self.db.collection("subscriptions").document(str(telegram_id))
             if not doc_ref.get().exists:
                 return False
-            doc_ref.update(
-                {
-                    "start_date": start_date,
-                    "expiry_date": expiry_date,
-                    "status": "active",
-                    "stripe_customer_id": stripe_customer_id,
-                    "stripe_subscription_id": stripe_subscription_id,
-                    "updated_at": datetime.utcnow(),
-                }
-            )
+            upd: Dict[str, Any] = {
+                "start_date": start_date,
+                "expiry_date": expiry_date,
+                "status": "active",
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_subscription_id": stripe_subscription_id,
+                "updated_at": datetime.utcnow(),
+            }
+            if stripe_price_id:
+                upd["stripe_price_id"] = stripe_price_id
+            doc_ref.update(upd)
             logger.info(
                 "Synced subscriptions/%s from Stripe (active, expiry=%s)",
                 telegram_id,

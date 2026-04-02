@@ -14,6 +14,7 @@ from telegram import Update
 from firestore_service import FirestoreService
 from gcp_stripe_service import (
     GCPStripeService,
+    _price_id_from_stripe_subscription,
     _subscription_period_bounds_unix,
     subscription_fallback_expiry,
 )
@@ -354,6 +355,7 @@ async def stripe_webhook(request: Request):
                         stripe_customer_id=subscription_data.get('stripe_customer_id'),
                         stripe_session_id=subscription_data.get('stripe_session_id'),
                         stripe_subscription_id=subscription_data.get('stripe_subscription_id'),
+                        stripe_price_id=subscription_data.get('stripe_price_id'),
                         amount_paid=subscription_data.get('amount_paid'),
                         currency=subscription_data.get('currency')
                     )
@@ -564,11 +566,13 @@ async def handle_recurring_payment(invoice):
         from datetime import datetime, timedelta
         
         # If we have a subscription ID, use it to get accurate period dates
+        recurring_price_id = None
         if subscription_id:
             try:
                 subscription = stripe.Subscription.retrieve(
                     subscription_id, expand=["items.data", "items.data.price"]
                 )
+                recurring_price_id = _price_id_from_stripe_subscription(subscription)
                 cps, cpe = _subscription_period_bounds_unix(subscription)
                 if cps is not None and cpe is not None:
                     current_period_start = datetime.fromtimestamp(cps, tz=pytz.UTC)
@@ -618,6 +622,7 @@ async def handle_recurring_payment(invoice):
             stripe_customer_id=customer_id,
             stripe_session_id=invoice.id,  # Use invoice ID as reference
             stripe_subscription_id=subscription_id,  # May be None for one-time payments
+            stripe_price_id=recurring_price_id,
             amount_paid=invoice.amount_paid / 100,  # Convert from cents
             currency=invoice.currency
         )
@@ -693,8 +698,11 @@ async def handle_subscription_updated(subscription):
             current_period_start = datetime.fromtimestamp(cps, tz=pytz.UTC)
             current_period_end = datetime.fromtimestamp(cpe, tz=pytz.UTC)
 
-            # Only update if the expiry date has actually changed
-            if existing_subscription.get('expiry_date') != current_period_end:
+            price_id = _price_id_from_stripe_subscription(sub_full)
+
+            exp_changed = existing_subscription.get("expiry_date") != current_period_end
+            price_changed = existing_subscription.get("stripe_price_id") != price_id
+            if exp_changed or price_changed:
                 success = firestore_service.upsert_subscription(
                     telegram_id=int(telegram_id),
                     start_date=current_period_start,
@@ -702,13 +710,14 @@ async def handle_subscription_updated(subscription):
                     subscription_type="premium",
                     stripe_customer_id=subscription.customer,
                     stripe_session_id=subscription.id,
-                    stripe_subscription_id=subscription.id
+                    stripe_subscription_id=subscription.id,
+                    stripe_price_id=price_id,
                 )
                 
                 if success:
                     logger.info(f"Updated subscription status for user {telegram_id}")
             else:
-                logger.info(f"Subscription expiry date unchanged for user {telegram_id}, skipping update")
+                logger.info(f"Subscription unchanged for user {telegram_id}, skipping update")
         else:
             # Subscription is not active, mark as expired
             success = firestore_service.mark_subscription_expired(int(telegram_id))

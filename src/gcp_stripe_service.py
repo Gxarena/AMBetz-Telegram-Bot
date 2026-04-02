@@ -52,6 +52,28 @@ def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[
     return None, None
 
 
+def _price_id_from_stripe_subscription(sub: Any) -> Optional[str]:
+    """Stripe Price id from the first subscription item (week / 2wk / month plan)."""
+    items = getattr(sub, "items", None)
+    data = getattr(items, "data", None) if items else None
+    if not data:
+        return None
+    it0 = data[0]
+    price = getattr(it0, "price", None)
+    if price is None and hasattr(it0, "get"):
+        price = it0.get("price")
+    if isinstance(price, str):
+        return price
+    if price is not None:
+        pid = getattr(price, "id", None)
+        if pid:
+            return str(pid)
+        if hasattr(price, "get"):
+            p = price.get("id")
+            return str(p) if p else None
+    return None
+
+
 def _sget(obj: Any, key: str) -> Any:
     if obj is None:
         return None
@@ -721,12 +743,14 @@ class GCPStripeService:
             if not cust_final:
                 return False
 
+            price_id = _price_id_from_stripe_subscription(sub_obj)
             ok = firestore_service.sync_subscription_active_from_stripe(
                 telegram_id=telegram_id,
                 start_date=start_dt,
                 expiry_date=end_dt,
                 stripe_customer_id=str(cust_final),
                 stripe_subscription_id=sub_obj.id,
+                stripe_price_id=price_id,
             )
             return bool(ok)
         except Exception as e:
@@ -736,6 +760,49 @@ class GCPStripeService:
                 e,
             )
             return False
+
+    def plan_display_for_subscription_doc(self, doc: Optional[Dict[str, Any]]) -> str:
+        """
+        Human-readable plan for /status: 1 week, 2 weeks, 1 month, free trial, etc.
+        Uses stored stripe_price_id when present; otherwise resolves from Stripe if possible.
+        """
+        if not doc:
+            return "—"
+        meta = doc.get("metadata") or {}
+        if isinstance(meta, dict) and meta.get("is_trial"):
+            return "Free trial"
+        st = (doc.get("subscription_type") or "").lower()
+        if st == "trial":
+            return "Free trial"
+
+        pid = doc.get("stripe_price_id")
+        if not pid and self.is_configured and doc.get("stripe_subscription_id"):
+            try:
+                sub = stripe.Subscription.retrieve(
+                    str(doc["stripe_subscription_id"]),
+                    expand=["items.data", "items.data.price"],
+                )
+                pid = _price_id_from_stripe_subscription(sub)
+            except Exception:
+                pid = None
+
+        if pid:
+            for p in self.get_subscription_plan_options():
+                if p["price_id"] == pid:
+                    key = p["key"]
+                    if key == "week":
+                        return "1 week"
+                    if key == "2week":
+                        return "2 weeks"
+                    if key == "month":
+                        return "1 month"
+            return "Premium (recurring)"
+
+        if st == "premium":
+            return "Premium"
+        if st == "test":
+            return "Test"
+        return st.title() if st else "Unknown"
     
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """Verify webhook signature from Stripe"""
@@ -952,6 +1019,9 @@ class GCPStripeService:
 
             if subscription_object is not None:
                 subscription_data["stripe_subscription_id"] = subscription_object.id
+                spid = _price_id_from_stripe_subscription(subscription_object)
+                if spid:
+                    subscription_data["stripe_price_id"] = spid
                 if customer_id:
                     removed = self.cancel_other_subscriptions_except(
                         str(customer_id), subscription_object.id

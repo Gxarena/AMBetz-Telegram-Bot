@@ -11,7 +11,7 @@ import logging
 import asyncio
 import pytz
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
 from google.cloud import logging as cloud_logging
 from google.cloud import secretmanager
@@ -253,7 +253,7 @@ class GCPTelegramBot:
             start_date = subscription.get("start_date")
             expiry_date = subscription.get("expiry_date")
             status = subscription.get("status", "unknown")
-            subscription_type = subscription.get("subscription_type", "basic")
+            plan_label = self.stripe_service.plan_display_for_subscription_doc(subscription)
 
             start_str = start_date.strftime("%Y-%m-%d %H:%M:%S") if start_date else "N/A"
             expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S") if expiry_date else "N/A"
@@ -261,7 +261,7 @@ class GCPTelegramBot:
             message = (
                 f"📊 *Subscription Status*\n\n"
                 f"Status: {status.upper()}\n"
-                f"Type: {subscription_type}\n"
+                f"Plan: {plan_label}\n"
                 f"Start Date: {start_str}\n"
                 f"Expiry Date: {expiry_str}\n"
             )
@@ -398,6 +398,7 @@ class GCPTelegramBot:
 *Available Commands:*
 /start - Welcome message and subscription options
 /status - Check your current subscription status
+/rejoin - New VIP invite links if your subscription is active but you were removed from the groups
 /cancel - Cancel your subscription (keeps access until period end)
 /help - Show this help message
 
@@ -1141,63 +1142,73 @@ Contact AM if you have any questions about your subscription.
         except Exception as e:
             logger.error(f"Error in check_expired_subscriptions: {e}")
 
-    async def generate_one_time_invite_links(self, user_id: int, username: str = None) -> Dict[str, str]:
-        """Generate one-time invite links for VIP channel and group"""
-        invite_links = {}
-        
-        # Generate invite link for VIP announcements group (if configured)
-        if self.vip_announcements_id:
+    async def generate_one_time_invite_links(
+        self,
+        user_id: int,
+        username: str = None,
+        *,
+        only_keys: Optional[Set[str]] = None,
+    ) -> Dict[str, str]:
+        """
+        Generate one-time invite links for VIP chats.
+        If only_keys is set (e.g. {'discussion'}), only those logical slots get a new link
+        (used by /rejoin so we do not issue extra links for chats the user is already in).
+
+        When announcements and discussion share the same chat_id, only one API call is made;
+        the first label in order (announcements) holds the link.
+        """
+        invite_links: Dict[str, str] = {}
+
+        targets: List[tuple[str, int]] = []
+        if self.vip_announcements_id and (only_keys is None or "announcements" in only_keys):
+            targets.append(("announcements", self.vip_announcements_id))
+        if self.vip_discussion_id and (only_keys is None or "discussion" in only_keys):
+            targets.append(("discussion", self.vip_discussion_id))
+
+        created_chat_ids: set[int] = set()
+        for label, cid in targets:
+            if cid in created_chat_ids:
+                continue
+            created_chat_ids.add(cid)
             try:
                 invite_link = await self.application.bot.create_chat_invite_link(
-                    chat_id=self.vip_announcements_id,
+                    chat_id=cid,
                     name=f"VIP Access for {username or user_id}",
                     creates_join_request=False,
-                    expire_date=datetime.utcnow() + timedelta(hours=24),  # Expire in 24 hours
-                    member_limit=1  # One-time use
+                    expire_date=datetime.utcnow() + timedelta(hours=24),
+                    member_limit=1,
                 )
-                invite_links['announcements'] = invite_link.invite_link
-                logger.info(f"Generated one-time invite link for announcements group for user {user_id}")
+                invite_links[label] = invite_link.invite_link
+                logger.info(
+                    "Generated one-time invite link for %s (chat_id=%s) user_id=%s",
+                    label,
+                    cid,
+                    user_id,
+                )
             except Exception as e:
                 logger.error(
-                    "VIP_INVITE_LINKS: create_chat_invite_link failed for announcements user_id=%s chat_id=%s: %s",
+                    "VIP_INVITE_LINKS: create_chat_invite_link failed for %s user_id=%s chat_id=%s: %s",
+                    label,
                     user_id,
-                    self.vip_announcements_id,
+                    cid,
                     e,
                     exc_info=True,
                 )
-        
-        # Generate invite link for VIP discussion group (if configured)
-        if self.vip_discussion_id:
-            try:
-                invite_link = await self.application.bot.create_chat_invite_link(
-                    chat_id=self.vip_discussion_id,
-                    name=f"VIP Access for {username or user_id}",
-                    creates_join_request=False,
-                    expire_date=datetime.utcnow() + timedelta(hours=24),  # Expire in 24 hours
-                    member_limit=1  # One-time use
-                )
-                invite_links['discussion'] = invite_link.invite_link
-                logger.info(f"Generated one-time invite link for discussion group for user {user_id}")
-            except Exception as e:
-                logger.error(
-                    "VIP_INVITE_LINKS: create_chat_invite_link failed for discussion user_id=%s chat_id=%s: %s",
-                    user_id,
-                    self.vip_discussion_id,
-                    e,
-                    exc_info=True,
-                )
-        
-        configured = []
-        if self.vip_announcements_id:
-            configured.append("announcements")
-        if self.vip_discussion_id:
-            configured.append("discussion")
-        if not configured:
+
+        if only_keys is not None:
+            configured = sorted(only_keys)
+        else:
+            configured = []
+            if self.vip_announcements_id:
+                configured.append("announcements")
+            if self.vip_discussion_id:
+                configured.append("discussion")
+        if not configured and only_keys is None:
             logger.warning(
                 "VIP_INVITE_LINKS: no VIP chat IDs configured (secrets vip-announcements-id / vip-chat-id); user_id=%s",
                 user_id,
             )
-        else:
+        elif configured:
             got = list(invite_links.keys())
             if not invite_links:
                 logger.error(
@@ -1206,7 +1217,7 @@ Contact AM if you have any questions about your subscription.
                     username or "",
                     configured,
                 )
-            elif set(got) != set(configured):
+            elif only_keys is None and set(got) != set(configured):
                 logger.error(
                     "VIP_INVITE_LINKS: partial failure user_id=%s username=%s expected=%s got=%s",
                     user_id,
@@ -1214,14 +1225,27 @@ Contact AM if you have any questions about your subscription.
                     configured,
                     got,
                 )
-        
+
         return invite_links
 
-    async def send_vip_invite_links(self, user_id: int, invite_links: Dict[str, str], username: str = None):
+    async def send_vip_invite_links(
+        self,
+        user_id: int,
+        invite_links: Dict[str, str],
+        username: str = None,
+        *,
+        rejoin: bool = False,
+    ):
         """Send VIP invite links to the user. Plain text (no Markdown) so invite URLs with _ or * don't break parsing."""
         try:
-            message = "🎉 Welcome to AMBetz VIP! 🎉\n\n"
-            message += "Your subscription is now active! Here are your exclusive invite links:\n\n"
+            if rejoin:
+                message = (
+                    "✅ Your subscription is active.\n\n"
+                    "Here are fresh one-time invite links only for the VIP group(s) you are not in yet:\n\n"
+                )
+            else:
+                message = "🎉 Welcome to AMBetz VIP! 🎉\n\n"
+                message += "Your subscription is now active! Here are your exclusive invite links:\n\n"
             
             if 'announcements' in invite_links:
                 message += "📢 VIP Announcements Channel\n"
@@ -1279,6 +1303,104 @@ Contact AM if you have any questions about your subscription.
                     exc_info=True,
                 )
 
+    async def _user_is_present_in_vip_chat(self, chat_id: int, user_id: int) -> bool | None:
+        """
+        True if user is member/admin/creator/restricted in the chat.
+        False if left/kicked. None if the bot could not determine (e.g. API error).
+        """
+        try:
+            member = await self.application.bot.get_chat_member(chat_id, user_id)
+            st = member.status
+            if hasattr(st, "value"):
+                st = st.value
+            if st in ("member", "administrator", "creator", "restricted"):
+                return True
+            if st in ("left", "kicked"):
+                return False
+            return False
+        except Exception as e:
+            logger.warning(
+                "get_chat_member failed chat_id=%s user_id=%s: %s",
+                chat_id,
+                user_id,
+                e,
+            )
+            return None
+
+    async def rejoin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Active subscribers who were removed from VIP chats (e.g. sync glitch) can get new invite links.
+        Uses Stripe→Firestore sync, then checks membership in configured VIP chats.
+        """
+        if not self._is_private_chat(update):
+            logger.info(f"Ignoring /rejoin in non-private chat {update.effective_chat.id}")
+            return
+
+        user_id = update.effective_user.id
+        username = update.effective_user.username
+
+        if not self.vip_announcements_id and not self.vip_discussion_id:
+            await update.effective_message.reply_text(
+                "VIP group links are not configured on this bot. Contact support."
+            )
+            return
+
+        try:
+            self._subscription_precheck_sync_stripe(user_id)
+            sub = self.firestore_service.get_subscription(user_id)
+            if not sub or sub.get("status") != "active":
+                await update.effective_message.reply_text(
+                    "You need an active subscription to get VIP invite links.\n\n"
+                    "Use /start to subscribe, or /status to see your billing state."
+                )
+                return
+
+            # Per chat: only issue invite links for chats the user is not in (avoids spare links).
+            slots: List[tuple[str, int]] = []
+            if self.vip_announcements_id:
+                slots.append(("announcements", self.vip_announcements_id))
+            if self.vip_discussion_id:
+                slots.append(("discussion", self.vip_discussion_id))
+
+            unique_cids = list({cid for _, cid in slots})
+            presence: dict[int, bool | None] = {}
+            for cid in unique_cids:
+                presence[cid] = await self._user_is_present_in_vip_chat(cid, user_id)
+
+            keys_needed: Set[str] = set()
+            cids_scheduled: set[int] = set()
+            for key, cid in slots:
+                p = presence.get(cid)
+                if p is True:
+                    continue
+                if cid in cids_scheduled:
+                    continue
+                cids_scheduled.add(cid)
+                keys_needed.add(key)
+
+            if not keys_needed:
+                await update.effective_message.reply_text(
+                    "You already appear to be in the VIP group(s). "
+                    "If something still looks wrong, contact support with your Telegram ID."
+                )
+                return
+
+            invite_links = await self.generate_one_time_invite_links(
+                user_id, username, only_keys=keys_needed
+            )
+            if not invite_links:
+                await update.effective_message.reply_text(
+                    "Could not generate invite links right now. Please try again in a few minutes or contact support."
+                )
+                return
+
+            await self.send_vip_invite_links(user_id, invite_links, username, rejoin=True)
+        except Exception as e:
+            logger.error(f"Error in rejoin_command: {e}", exc_info=True)
+            await update.effective_message.reply_text(
+                f"Something went wrong. Please try again or contact support. ({e})"
+            )
+
     def setup_application(self) -> Application:
         """Setup and configure the Telegram application"""
         logger.info("Setting up Telegram bot application...")
@@ -1289,6 +1411,7 @@ Contact AM if you have any questions about your subscription.
         # Add command handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
+        self.application.add_handler(CommandHandler("rejoin", self.rejoin_command))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("cancel", self.cancel_command))
         self.application.add_handler(CommandHandler("chatinfo", self.get_chat_info))
