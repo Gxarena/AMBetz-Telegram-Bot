@@ -52,26 +52,94 @@ def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[
     return None, None
 
 
+def _price_id_from_obj(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    pid = getattr(obj, "id", None)
+    if pid:
+        return str(pid)
+    if isinstance(obj, dict):
+        p = obj.get("id")
+        return str(p) if p else None
+    if hasattr(obj, "get"):
+        p = obj.get("id")
+        return str(p) if p else None
+    return None
+
+
 def _price_id_from_stripe_subscription(sub: Any) -> Optional[str]:
     """Stripe Price id from the first subscription item (week / 2wk / month plan)."""
     items = getattr(sub, "items", None)
-    data = getattr(items, "data", None) if items else None
+    if items is None and hasattr(sub, "get"):
+        items = sub.get("items")
+    data = None
+    if items is not None:
+        data = items.get("data") if isinstance(items, dict) else getattr(items, "data", None)
     if not data:
         return None
     it0 = data[0]
-    price = getattr(it0, "price", None)
-    if price is None and hasattr(it0, "get"):
+    price = None
+    if isinstance(it0, dict):
         price = it0.get("price")
-    if isinstance(price, str):
-        return price
-    if price is not None:
-        pid = getattr(price, "id", None)
-        if pid:
-            return str(pid)
-        if hasattr(price, "get"):
-            p = price.get("id")
-            return str(p) if p else None
-    return None
+    else:
+        price = getattr(it0, "price", None)
+        if price is None and hasattr(it0, "get"):
+            price = it0.get("price")
+    pid = _price_id_from_obj(price)
+    if pid:
+        return pid
+    # Webhooks / older API shapes: nested `plan` on the item (often same id as `price`)
+    plan = None
+    if isinstance(it0, dict):
+        plan = it0.get("plan")
+    else:
+        plan = getattr(it0, "plan", None)
+        if plan is None and hasattr(it0, "get"):
+            plan = it0.get("plan")
+    return _price_id_from_obj(plan)
+
+
+def _plan_label_from_stripe_price_id(price_id: str) -> Optional[str]:
+    """
+    When configured secrets don't match the live Price id, derive a label from
+    Stripe Price.recurring (interval / interval_count).
+    """
+    if not price_id or not str(price_id).startswith("price_"):
+        return None
+    try:
+        pr = stripe.Price.retrieve(str(price_id))
+    except Exception:
+        return None
+    rec = getattr(pr, "recurring", None)
+    if rec is None and hasattr(pr, "get"):
+        rec = pr.get("recurring")
+    if not rec:
+        return None
+    interval = getattr(rec, "interval", None)
+    if interval is None and isinstance(rec, dict):
+        interval = rec.get("interval")
+    ic = getattr(rec, "interval_count", None)
+    if ic is None and isinstance(rec, dict):
+        ic = rec.get("interval_count")
+    if not interval:
+        return None
+    try:
+        n = int(ic) if ic is not None else 1
+    except (TypeError, ValueError):
+        n = 1
+    n = max(1, n)
+    interval = str(interval).lower()
+    if interval == "week":
+        return "1 week" if n == 1 else f"{n} weeks"
+    if interval == "month":
+        return "1 month" if n == 1 else f"{n} months"
+    if interval == "year":
+        return "1 year" if n == 1 else f"{n} years"
+    if interval == "day":
+        return "1 day" if n == 1 else f"{n} days"
+    return f"{n} × {interval}"
 
 
 def _sget(obj: Any, key: str) -> Any:
@@ -780,7 +848,7 @@ class GCPStripeService:
             try:
                 sub = stripe.Subscription.retrieve(
                     str(doc["stripe_subscription_id"]),
-                    expand=["items.data", "items.data.price"],
+                    expand=["items.data.price"],
                 )
                 pid = _price_id_from_stripe_subscription(sub)
             except Exception:
@@ -796,6 +864,9 @@ class GCPStripeService:
                         return "2 weeks"
                     if key == "month":
                         return "1 month"
+            api_label = _plan_label_from_stripe_price_id(str(pid))
+            if api_label:
+                return api_label
             return "Premium (recurring)"
 
         if st == "premium":
