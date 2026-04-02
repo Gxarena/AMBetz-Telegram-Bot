@@ -838,6 +838,121 @@ class GCPStripeService:
             )
             return False
 
+    def _resolve_stripe_price_id_for_plan_display(
+        self,
+        doc: Dict[str, Any],
+        telegram_id: Optional[int],
+        log_pfx: str,
+    ) -> Optional[str]:
+        """
+        When Firestore omits stripe_price_id (and often stripe_subscription_id), resolve the
+        active Price id the same way try_refresh does: subscription id → customer →
+        Customer.search(telegram_id).
+        """
+        if not self.is_configured:
+            logger.info("%s skip price resolve: Stripe not configured", log_pfx)
+            return None
+
+        sub_id = doc.get("stripe_subscription_id")
+        if sub_id:
+            try:
+                sub = stripe.Subscription.retrieve(
+                    str(sub_id),
+                    expand=["items.data.price"],
+                )
+                pid = _price_id_from_stripe_subscription(sub)
+                logger.info(
+                    "%s resolved via stripe_subscription_id=%r -> price_id=%r",
+                    log_pfx,
+                    sub_id,
+                    pid,
+                )
+                return pid
+            except Exception as e:
+                logger.warning(
+                    "%s Subscription.retrieve(%r) failed: %s",
+                    log_pfx,
+                    sub_id,
+                    e,
+                    exc_info=True,
+                )
+
+        cust_raw = doc.get("stripe_customer_id")
+        if isinstance(cust_raw, dict):
+            cust_raw = cust_raw.get("id")
+        cust_id = str(cust_raw).strip() if cust_raw else None
+
+        if cust_id:
+            try:
+                sub_pick, reason = self._pick_canonical_subscription_id(cust_id)
+                logger.info(
+                    "%s canonical sub for stripe_customer_id=%r -> %r (%s)",
+                    log_pfx,
+                    cust_id,
+                    sub_pick,
+                    reason,
+                )
+                if sub_pick:
+                    sub = stripe.Subscription.retrieve(
+                        sub_pick, expand=["items.data.price"]
+                    )
+                    pid = _price_id_from_stripe_subscription(sub)
+                    logger.info(
+                        "%s resolved via customer -> subscription -> price_id=%r",
+                        log_pfx,
+                        pid,
+                    )
+                    return pid
+            except Exception as e:
+                logger.warning(
+                    "%s resolve via stripe_customer_id failed: %s",
+                    log_pfx,
+                    e,
+                    exc_info=True,
+                )
+
+        if telegram_id is not None:
+            try:
+                customers = stripe.Customer.search(
+                    query=f"metadata['telegram_id']:'{telegram_id}'",
+                    limit=5,
+                )
+                if not customers.data:
+                    logger.info(
+                        "%s Customer.search(telegram_id) found no Stripe customer",
+                        log_pfx,
+                    )
+                    return None
+                cid = customers.data[0].id
+                sub_pick, reason = self._pick_canonical_subscription_id(cid)
+                logger.info(
+                    "%s Customer.search -> %r; canonical sub=%r (%s)",
+                    log_pfx,
+                    cid,
+                    sub_pick,
+                    reason,
+                )
+                if sub_pick:
+                    sub = stripe.Subscription.retrieve(
+                        sub_pick, expand=["items.data.price"]
+                    )
+                    pid = _price_id_from_stripe_subscription(sub)
+                    logger.info(
+                        "%s resolved via Customer.search path -> price_id=%r",
+                        log_pfx,
+                        pid,
+                    )
+                    return pid
+            except Exception as e:
+                logger.warning(
+                    "%s Customer.search resolve failed: %s",
+                    log_pfx,
+                    e,
+                    exc_info=True,
+                )
+
+        return None
+
     def plan_display_for_subscription_doc(
         self, doc: Optional[Dict[str, Any]], telegram_id: Optional[int] = None
     ) -> str:
@@ -865,46 +980,21 @@ class GCPStripeService:
 
         pid = doc.get("stripe_price_id")
         sub_id = doc.get("stripe_subscription_id")
+        cust_log = doc.get("stripe_customer_id")
         logger.info(
-            "%s inputs: stripe_price_id=%r stripe_subscription_id=%r "
+            "%s inputs: stripe_price_id=%r stripe_subscription_id=%r stripe_customer_id=%r "
             "subscription_type=%r status=%r stripe_service.is_configured=%s",
             log_pfx,
             pid,
             sub_id,
+            cust_log,
             st,
             doc.get("status"),
             self.is_configured,
         )
 
-        if not pid and self.is_configured and sub_id:
-            try:
-                sub = stripe.Subscription.retrieve(
-                    str(sub_id),
-                    expand=["items.data.price"],
-                )
-                pid = _price_id_from_stripe_subscription(sub)
-                logger.info(
-                    "%s Subscription.retrieve(%r) ok; resolved_price_id=%r",
-                    log_pfx,
-                    sub_id,
-                    pid,
-                )
-            except Exception as e:
-                logger.warning(
-                    "%s Subscription.retrieve(%r) failed: %s",
-                    log_pfx,
-                    sub_id,
-                    e,
-                    exc_info=True,
-                )
-                pid = None
-        elif not pid:
-            logger.info(
-                "%s skip Stripe retrieve: need is_configured=%s and stripe_subscription_id=%r",
-                log_pfx,
-                self.is_configured,
-                sub_id,
-            )
+        if not pid:
+            pid = self._resolve_stripe_price_id_for_plan_display(doc, telegram_id, log_pfx)
 
         if pid:
             opts = self.get_subscription_plan_options()
@@ -935,7 +1025,7 @@ class GCPStripeService:
             return "Premium (recurring)"
 
         logger.info(
-            "%s no price_id after Firestore + retrieve; subscription_type=%r -> generic label path",
+            "%s no price_id after Firestore + Stripe resolution; subscription_type=%r -> generic label path",
             log_pfx,
             st,
         )
