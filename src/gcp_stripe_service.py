@@ -586,7 +586,7 @@ class GCPStripeService:
             raise
     
     def cancel_active_subscriptions(self, telegram_id: int) -> bool:
-        """Cancel all active and trialing subscriptions for a customer (dev/testing only)"""
+        """Cancel all active and trialing subscriptions for a customer (e.g. orphan subs after sync)."""
         if not self.is_configured:
             raise ValueError("Stripe is not configured")
         
@@ -629,6 +629,113 @@ class GCPStripeService:
         except Exception as e:
             logger.error(f"Error cancelling subscriptions for telegram_id {telegram_id}: {e}")
             raise
+
+    def _pick_canonical_subscription_id(self, customer_id: str) -> Tuple[Optional[str], str]:
+        """If multiple active/trialing subs, pick the one with the latest current_period_end."""
+        candidates: List[str] = []
+        for st in ("active", "trialing"):
+            for sub in _list_subscriptions_paginated(customer_id, st):
+                candidates.append(sub.id)
+        if not candidates:
+            return None, "no_active_or_trialing"
+        if len(candidates) == 1:
+            return candidates[0], "single_match"
+        best_id: Optional[str] = None
+        best_end = 0
+        for sid in candidates:
+            try:
+                full = stripe.Subscription.retrieve(
+                    sid, expand=["items.data", "items.data.price"]
+                )
+                _, pe = _subscription_period_bounds_unix(full)
+                if pe is not None and pe >= best_end:
+                    best_end = pe
+                    best_id = sid
+            except Exception as exc:
+                logger.warning("Could not retrieve subscription %s for pick: %s", sid, exc)
+        if best_id:
+            return best_id, f"picked_latest_period_end_among_{len(candidates)}"
+        return candidates[0], f"fallback_first_of_{len(candidates)}"
+
+    def try_refresh_firestore_mirror_from_stripe(self, telegram_id: int, firestore_service: Any) -> bool:
+        """
+        Stripe is the billing source of truth. If Stripe shows active/trialing with
+        current_period_end in the future, update Firestore to match (merge-update).
+
+        Returns True if Firestore was updated to active with Stripe's period bounds.
+        """
+        if not self.is_configured:
+            return False
+        try:
+            existing = firestore_service.get_subscription(telegram_id)
+            customer_id = (existing or {}).get("stripe_customer_id")
+            sub_id_from_doc = (existing or {}).get("stripe_subscription_id")
+
+            sub_obj = None
+            resolved_customer_id = customer_id
+
+            if sub_id_from_doc:
+                try:
+                    sub_obj = stripe.Subscription.retrieve(
+                        sub_id_from_doc,
+                        expand=["items.data", "items.data.price"],
+                    )
+                except stripe.InvalidRequestError:
+                    sub_obj = None
+
+            if sub_obj is None or getattr(sub_obj, "status", None) not in ("active", "trialing"):
+                if not resolved_customer_id:
+                    customers = stripe.Customer.search(
+                        query=f"metadata['telegram_id']:'{telegram_id}'",
+                        limit=5,
+                    )
+                    if not customers.data:
+                        return False
+                    resolved_customer_id = customers.data[0].id
+                sub_pick, _ = self._pick_canonical_subscription_id(resolved_customer_id)
+                if not sub_pick:
+                    return False
+                sub_obj = stripe.Subscription.retrieve(
+                    sub_pick, expand=["items.data", "items.data.price"]
+                )
+
+            st = getattr(sub_obj, "status", None)
+            if st not in ("active", "trialing"):
+                return False
+
+            cps_u, cpe_u = _subscription_period_bounds_unix(sub_obj)
+            if cpe_u is None:
+                return False
+            now_ts = int(time.time())
+            if cpe_u < now_ts:
+                return False
+
+            if cps_u is None:
+                cps_u = cpe_u
+            start_dt = datetime.fromtimestamp(cps_u, tz=pytz.UTC)
+            end_dt = datetime.fromtimestamp(cpe_u, tz=pytz.UTC)
+
+            cust_final = resolved_customer_id or getattr(sub_obj, "customer", None)
+            if isinstance(cust_final, dict):
+                cust_final = cust_final.get("id")
+            if not cust_final:
+                return False
+
+            ok = firestore_service.sync_subscription_active_from_stripe(
+                telegram_id=telegram_id,
+                start_date=start_dt,
+                expiry_date=end_dt,
+                stripe_customer_id=str(cust_final),
+                stripe_subscription_id=sub_obj.id,
+            )
+            return bool(ok)
+        except Exception as e:
+            logger.warning(
+                "try_refresh_firestore_mirror_from_stripe failed for telegram_id=%s: %s",
+                telegram_id,
+                e,
+            )
+            return False
     
     def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
         """Verify webhook signature from Stripe"""

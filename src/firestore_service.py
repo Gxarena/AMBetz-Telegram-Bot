@@ -285,6 +285,42 @@ class FirestoreService:
             logger.error(f"Error marking subscription expired for user {telegram_id}: {e}")
             return False
 
+    def sync_subscription_active_from_stripe(
+        self,
+        telegram_id: int,
+        start_date: datetime,
+        expiry_date: datetime,
+        stripe_customer_id: str,
+        stripe_subscription_id: str,
+    ) -> bool:
+        """
+        Merge-update billing fields from Stripe (source of truth) without wiping
+        stripe_session_id, amount_paid, currency, metadata, etc.
+        """
+        try:
+            doc_ref = self.db.collection("subscriptions").document(str(telegram_id))
+            if not doc_ref.get().exists:
+                return False
+            doc_ref.update(
+                {
+                    "start_date": start_date,
+                    "expiry_date": expiry_date,
+                    "status": "active",
+                    "stripe_customer_id": stripe_customer_id,
+                    "stripe_subscription_id": stripe_subscription_id,
+                    "updated_at": datetime.utcnow(),
+                }
+            )
+            logger.info(
+                "Synced subscriptions/%s from Stripe (active, expiry=%s)",
+                telegram_id,
+                expiry_date,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error syncing subscription from Stripe for user {telegram_id}: {e}")
+            return False
+
     def set_subscription_cancelled_expired(
         self,
         telegram_id: int,

@@ -1069,6 +1069,16 @@ async def check_expired_subscriptions():
             telegram_id = subscription.get('telegram_id')
             if not telegram_id:
                 continue
+
+            if stripe_service.is_configured:
+                if stripe_service.try_refresh_firestore_mirror_from_stripe(
+                    int(telegram_id), firestore_service
+                ):
+                    logger.info(
+                        "Skipped expire/kick (HTTP): Firestore synced from Stripe for telegram_id=%s",
+                        telegram_id,
+                    )
+                    continue
                 
             try:
                 # Mark as expired in Firestore

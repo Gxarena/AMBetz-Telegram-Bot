@@ -246,6 +246,7 @@ class GCPTelegramBot:
 
     async def _send_status_reply(self, update: Update, user_id: int) -> None:
         """Send status text; works from /status and from menu button callbacks."""
+        self._subscription_precheck_sync_stripe(user_id)
         subscription = self.firestore_service.get_subscription(user_id)
 
         if subscription:
@@ -279,6 +280,42 @@ class GCPTelegramBot:
             await update.effective_message.reply_text(
                 "You don't have an active subscription. Subscribe now to get started!",
                 reply_markup=reply_markup,
+            )
+
+    def _subscription_precheck_sync_stripe(self, user_id: int):
+        """
+        Stripe is billing source of truth: refresh Firestore mirror before checkout or /status-style flows.
+        Returns latest subscriptions/{user_id} document (or None).
+        """
+        if self.stripe_service.is_configured:
+            if self.stripe_service.try_refresh_firestore_mirror_from_stripe(
+                user_id, self.firestore_service
+            ):
+                logger.info("Precheck: Firestore synced from Stripe for user %s", user_id)
+        return self.firestore_service.get_subscription(user_id)
+
+    def _orphan_stripe_cancel_if_still_expired(self, user_id: int) -> None:
+        """
+        After a Stripe→Firestore sync, if Firestore is still expired, cancel lingering
+        active Stripe subscriptions so Checkout can open (true orphans only).
+        """
+        try:
+            sub = self.firestore_service.get_subscription(user_id)
+            if not sub or sub.get("status") != "expired":
+                return
+            if not self.stripe_service.is_configured:
+                return
+            if self.stripe_service.cancel_active_subscriptions(user_id):
+                logger.info(
+                    "Cancelled orphan Stripe subscription(s) for telegram_id=%s "
+                    "(Firestore still expired after Stripe sync)",
+                    user_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Orphan Stripe cancel for user %s failed: %s",
+                user_id,
+                e,
             )
 
     async def add_user_to_vip_groups(self, user_id: int, username: str = None) -> bool:
@@ -708,7 +745,7 @@ Contact AM if you have any questions about your subscription.
         price_id: str | None,
     ) -> None:
         """Open Stripe checkout for the given price (or default monthly if price_id is None)."""
-        existing_subscription = self.firestore_service.get_subscription(user_id)
+        existing_subscription = self._subscription_precheck_sync_stripe(user_id)
         if existing_subscription and existing_subscription.get("status") == "active":
             expiry_date = existing_subscription["expiry_date"]
             await query.message.reply_text(
@@ -726,6 +763,8 @@ Contact AM if you have any questions about your subscription.
                 "For testing, you can use /test to create a test subscription."
             )
             return
+
+        self._orphan_stripe_cancel_if_still_expired(user_id)
 
         try:
             payment_url = self.stripe_service.create_subscription_checkout(
@@ -749,7 +788,7 @@ Contact AM if you have any questions about your subscription.
         plans: List[Dict[str, str]],
     ) -> None:
         """Single message: intro text + one Stripe Checkout URL button per plan."""
-        existing_subscription = self.firestore_service.get_subscription(user_id)
+        existing_subscription = self._subscription_precheck_sync_stripe(user_id)
         if existing_subscription and existing_subscription.get("status") == "active":
             expiry_date = existing_subscription["expiry_date"]
             await query.message.reply_text(
@@ -767,6 +806,8 @@ Contact AM if you have any questions about your subscription.
                 "For testing, you can use /test to create a test subscription."
             )
             return
+
+        self._orphan_stripe_cancel_if_still_expired(user_id)
 
         rows: list = []
         first_error: Exception | None = None
@@ -837,7 +878,7 @@ Contact AM if you have any questions about your subscription.
         if data == "subscribe":
             user_id = update.effective_user.id
             username = update.effective_user.username
-            existing_subscription = self.firestore_service.get_subscription(user_id)
+            existing_subscription = self._subscription_precheck_sync_stripe(user_id)
             if existing_subscription and existing_subscription.get("status") == "active":
                 expiry_date = existing_subscription["expiry_date"]
                 await query.message.reply_text(
@@ -865,7 +906,7 @@ Contact AM if you have any questions about your subscription.
             user_id = update.effective_user.id
             username = update.effective_user.username or "Unknown"
             
-            existing_subscription = self.firestore_service.get_subscription(user_id)
+            existing_subscription = self._subscription_precheck_sync_stripe(user_id)
             
             # Check 1: Active subscription
             if existing_subscription and existing_subscription.get('status') == 'active':
@@ -892,6 +933,7 @@ Contact AM if you have any questions about your subscription.
             # Check if Stripe is configured
             if self.stripe_service.is_configured:
                 try:
+                    self._orphan_stripe_cancel_if_still_expired(user_id)
                     # Create trial subscription checkout (3-day free trial)
                     trial_url = self.stripe_service.create_trial_subscription_checkout(user_id, username, trial_days=3)
                     
@@ -1021,6 +1063,17 @@ Contact AM if you have any questions about your subscription.
                 telegram_id = subscription.get("telegram_id")
                 if not telegram_id:
                     continue
+
+                # Stripe is source of truth: if still entitled in Stripe, refresh Firestore and do not kick
+                if self.stripe_service.is_configured:
+                    if self.stripe_service.try_refresh_firestore_mirror_from_stripe(
+                        telegram_id, self.firestore_service
+                    ):
+                        logger.info(
+                            "Skipped expire/kick: Firestore synced from Stripe for telegram_id=%s",
+                            telegram_id,
+                        )
+                        continue
                 
                 # Update subscription status in Firestore
                 success = self.firestore_service.mark_subscription_expired(telegram_id)
