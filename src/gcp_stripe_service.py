@@ -166,6 +166,93 @@ def _sget(obj: Any, key: str) -> Any:
         return None
 
 
+def _subscription_id_from_invoice(invoice: Any) -> Optional[str]:
+    """
+    Resolve Subscription id from an Invoice (top-level or line-item shapes).
+    Stripe Checkout's first paid invoice usually has invoice.subscription set;
+    some API/webhook shapes only embed the id under line items.
+    """
+    sid = _sget(invoice, "subscription")
+    if sid:
+        if isinstance(sid, str):
+            return sid
+        pid = _sget(sid, "id")
+        return str(pid) if pid else None
+
+    lines = _sget(invoice, "lines")
+    data = _sget(lines, "data") if lines is not None else None
+    if not data:
+        return None
+
+    for line in data:
+        lsid = _sget(line, "subscription")
+        if lsid:
+            if isinstance(lsid, str):
+                return lsid
+            pid = _sget(lsid, "id")
+            if pid:
+                return str(pid)
+        parent = _sget(line, "parent")
+        if isinstance(parent, dict):
+            sidetails = parent.get("subscription_item_details")
+            if isinstance(sidetails, dict):
+                sub = sidetails.get("subscription")
+                if sub:
+                    return str(sub)
+        if isinstance(line, dict):
+            pd = line.get("parent") or {}
+            sidetails = pd.get("subscription_item_details") if isinstance(pd, dict) else None
+            if isinstance(sidetails, dict) and sidetails.get("subscription"):
+                return str(sidetails["subscription"])
+    return None
+
+
+def _invoice_period_bounds_unix(invoice: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Billing period from Invoice.period_* (set on subscription invoices) or from
+    line-item periods. Picks the line period with the latest end time when multiple
+    lines exist (avoids proration snippets shorter than the subscription cycle).
+    """
+    ps = _sget(invoice, "period_start")
+    pe = _sget(invoice, "period_end")
+    if ps is not None and pe is not None:
+        try:
+            ips, ipe = int(ps), int(pe)
+            if ipe > ips:
+                return ips, ipe
+        except (TypeError, ValueError):
+            pass
+
+    lines = _sget(invoice, "lines")
+    data = _sget(lines, "data") if lines is not None else None
+    if not data:
+        return None, None
+
+    best_end: Optional[int] = None
+    best_start: Optional[int] = None
+    for line in data:
+        period = _sget(line, "period")
+        if not period:
+            continue
+        ls = _sget(period, "start")
+        le = _sget(period, "end")
+        if ls is None or le is None:
+            continue
+        try:
+            ls_i, le_i = int(ls), int(le)
+        except (TypeError, ValueError):
+            continue
+        if le_i <= ls_i:
+            continue
+        if best_end is None or le_i > best_end:
+            best_end = le_i
+            best_start = ls_i
+
+    if best_start is not None and best_end is not None:
+        return best_start, best_end
+    return None, None
+
+
 def _add_calendar_months(dt: datetime, months: int) -> datetime:
     if months <= 0:
         return dt
@@ -180,7 +267,7 @@ def _add_calendar_months(dt: datetime, months: int) -> datetime:
 
 def _expiry_from_recurring_start(
     start: datetime, interval: str, interval_count: int
-) -> datetime:
+) -> Optional[datetime]:
     n = max(1, interval_count)
     iv = (interval or "").lower()
     if iv == "day":
@@ -191,7 +278,91 @@ def _expiry_from_recurring_start(
         return _add_calendar_months(start, n)
     if iv == "year":
         return _add_calendar_months(start, 12 * n)
-    return start + timedelta(days=30)
+    logger.warning(
+        "Unsupported Stripe recurring interval %r (interval_count=%s); cannot derive expiry from price",
+        interval,
+        interval_count,
+    )
+    return None
+
+
+def expiry_from_recurring_price_id(
+    start_date: datetime, price_id: Optional[str]
+) -> Optional[datetime]:
+    """Compute next expiry from a Price id using its recurring interval (subscription prices)."""
+    if not price_id or not str(price_id).startswith("price_"):
+        return None
+    try:
+        pr = stripe.Price.retrieve(str(price_id))
+    except Exception as exc:
+        logger.warning("expiry_from_recurring_price_id: Price.retrieve(%s) failed: %s", price_id, exc)
+        return None
+    rec = _sget(pr, "recurring")
+    if not rec:
+        return None
+    interval = _sget(rec, "interval")
+    ic_raw = _sget(rec, "interval_count")
+    try:
+        ic = int(ic_raw) if ic_raw is not None else 1
+    except (TypeError, ValueError):
+        ic = 1
+    if not interval:
+        return None
+    return _expiry_from_recurring_start(start_date, str(interval), ic)
+
+
+def _price_ids_from_invoice_line(line: Any) -> List[str]:
+    """Collect price ids from an invoice line (classic and newer API shapes)."""
+    out: List[str] = []
+    p = _sget(line, "price")
+    if isinstance(p, str) and p.startswith("price_"):
+        out.append(p)
+    else:
+        pid = _price_id_from_obj(p)
+        if pid:
+            out.append(pid)
+    plan = _sget(line, "plan")
+    if plan:
+        pid = _price_id_from_obj(plan)
+        if pid:
+            out.append(pid)
+    pricing = _sget(line, "pricing")
+    if pricing:
+        pd = _sget(pricing, "price_details")
+        if pd:
+            raw = _sget(pd, "price")
+            if isinstance(raw, str) and raw.startswith("price_"):
+                out.append(raw)
+            else:
+                pid = _price_id_from_obj(raw)
+                if pid:
+                    out.append(pid)
+    seen: set = set()
+    deduped: List[str] = []
+    for pid in out:
+        if pid not in seen:
+            seen.add(pid)
+            deduped.append(pid)
+    return deduped
+
+
+def expiry_from_invoice_recurring_prices(
+    invoice: Any, start_date: datetime
+) -> Optional[datetime]:
+    """
+    Derive subscription length from recurring Price objects referenced on invoice lines.
+    Tries each distinct price id until one has recurring.interval set.
+    """
+    lines = _sget(invoice, "lines")
+    data = _sget(lines, "data") if lines else None
+    if not data:
+        return None
+    for line in data:
+        for pid in _price_ids_from_invoice_line(line):
+            exp = expiry_from_recurring_price_id(start_date, pid)
+            if exp is not None:
+                return exp
+    return None
 
 
 def subscription_fallback_expiry(
@@ -199,12 +370,13 @@ def subscription_fallback_expiry(
     start_date: datetime,
     *,
     is_trial: bool = False,
-) -> datetime:
+    invoice: Any = None,
+) -> Optional[datetime]:
     """
-    When current_period_start/end are missing: use first line item's price.recurring
-    (day/week/month/year × interval_count). Trial → +3 days. If price not expanded
-    or no recurring, +30 days.
-    Retrieve subscriptions with expand=['items.data', 'items.data.price'].
+    When current_period_start/end are missing: use first subscription item's price.recurring
+    (via expanded object or Price.retrieve). Trial → +3 days.
+    If still unknown, optionally resolve from invoice line prices.
+    Returns None if expiry cannot be derived (caller should avoid guessing 30 days).
     """
     if is_trial:
         return start_date + timedelta(days=3)
@@ -217,16 +389,33 @@ def subscription_fallback_expiry(
             if hasattr(items_obj, "get")
             else getattr(items_obj, "data", None)
         )
+
+    def _from_invoice() -> Optional[datetime]:
+        if invoice is None:
+            return None
+        return expiry_from_invoice_recurring_prices(invoice, start_date)
+
     if not data:
-        return start_date + timedelta(days=30)
+        return _from_invoice()
 
     price = _sget(data[0], "price")
     if isinstance(price, str):
-        return start_date + timedelta(days=30)
+        price_id_str = str(price)
+        if not price_id_str.startswith("price_"):
+            return _from_invoice()
+        try:
+            price = stripe.Price.retrieve(price_id_str)
+        except Exception as exc:
+            logger.warning(
+                "subscription_fallback_expiry: Price.retrieve(%s) failed: %s",
+                price_id_str,
+                exc,
+            )
+            return _from_invoice()
 
     rec = _sget(price, "recurring")
     if not rec:
-        return start_date + timedelta(days=30)
+        return _from_invoice()
 
     interval = _sget(rec, "interval")
     ic_raw = _sget(rec, "interval_count")
@@ -236,18 +425,12 @@ def subscription_fallback_expiry(
         ic = 1
 
     if not interval:
-        return start_date + timedelta(days=30)
+        return _from_invoice()
 
-    try:
-        return _expiry_from_recurring_start(start_date, str(interval), ic)
-    except Exception as exc:
-        logger.warning(
-            "subscription_fallback_expiry: interval=%s count=%s: %s",
-            interval,
-            ic,
-            exc,
-        )
-        return start_date + timedelta(days=30)
+    exp = _expiry_from_recurring_start(start_date, str(interval), ic)
+    if exp is not None:
+        return exp
+    return _from_invoice()
 
 
 def _list_subscriptions_paginated(customer_id: str, status: str) -> List[Any]:
@@ -1196,9 +1379,36 @@ class GCPStripeService:
                     start_date = datetime.fromtimestamp(
                         subscription_object.created, tz=pytz.UTC
                     )
-                    expiry_date = subscription_fallback_expiry(
-                        subscription_object, start_date, is_trial=is_trial
+                    inv_obj = None
+                    raw_inv = (
+                        getattr(session_data, "invoice", None)
+                        if hasattr(session_data, "invoice")
+                        else session_data.get("invoice")
                     )
+                    if raw_inv:
+                        inv_id = raw_inv if isinstance(raw_inv, str) else _sget(raw_inv, "id")
+                        if inv_id:
+                            try:
+                                inv_obj = stripe.Invoice.retrieve(
+                                    str(inv_id), expand=["lines.data.price"]
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Could not load invoice %s for period fallback: %s",
+                                    inv_id,
+                                    exc,
+                                )
+                    expiry_date = subscription_fallback_expiry(
+                        subscription_object,
+                        start_date,
+                        is_trial=is_trial,
+                        invoice=inv_obj,
+                    )
+                    if expiry_date is None:
+                        raise ValueError(
+                            f"Subscription {subscription_object.id}: could not derive expiry "
+                            f"from price/recurring or invoice lines"
+                        )
                 else:
                     raise ValueError(
                         f"Subscription {subscription_object.id} has no date information available"
@@ -1209,12 +1419,31 @@ class GCPStripeService:
                         f"Trial subscription detected for user {telegram_id}, trial ends at {expiry_date}"
                     )
             else:
-                # This is a one-time payment, calculate dates manually
+                # One-time payment (no subscription on session): duration from Price if present, else env.
                 start_date = datetime.now(pytz.UTC)
                 if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
                     expiry_date = start_date + timedelta(minutes=1)
                 else:
-                    expiry_date = start_date + timedelta(days=30)
+                    expiry_date = None
+                    line_items = getattr(session_data, "line_items", None)
+                    li_data = None
+                    if line_items is not None:
+                        li_data = getattr(line_items, "data", None) or (
+                            line_items.get("data") if hasattr(line_items, "get") else None
+                        )
+                    if li_data and len(li_data) > 0:
+                        pr = None
+                        it0 = li_data[0]
+                        if hasattr(it0, "price"):
+                            pr = it0.price
+                        elif isinstance(it0, dict):
+                            pr = it0.get("price")
+                        pid = _price_id_from_obj(pr) if pr else None
+                        if pid:
+                            expiry_date = expiry_from_recurring_price_id(start_date, pid)
+                    if expiry_date is None:
+                        days = int(os.getenv("ONE_TIME_CHECKOUT_ACCESS_DAYS", "30"))
+                        expiry_date = start_date + timedelta(days=days)
             
             if hasattr(session_data, 'id'):
                 session_id = session_data.id

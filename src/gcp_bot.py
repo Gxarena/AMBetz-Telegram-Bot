@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Set
 from google.cloud import logging as cloud_logging
 from google.cloud import secretmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 import stripe
@@ -46,6 +47,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Single label for all “return to main menu” inline buttons (U+2190, not `<-` or emoji arrows).
+INLINE_BACK_BUTTON_TEXT = "← Back"
 
 # Local dev: skip Cloud Logging (ADC quota project may point at an old/deleted GCP project).
 # Cloud Run sets K_SERVICE — enable Cloud Logging there only.
@@ -111,9 +115,22 @@ class GCPTelegramBot:
         
     def _get_secret(self, secret_name: str) -> str:
         """Get secret from GCP Secret Manager"""
+        dev = os.getenv("DEVELOPMENT_MODE", "false").lower() == "true"
+        # Local dev: prefer .env over Secret Manager for the Telegram token so a revoked
+        # or stale `telegram-bot-token-test` secret does not override TELEGRAM_BOT_TOKEN.
+        if secret_name == "telegram-bot-token" and dev:
+            for env_key in ("TELEGRAM_BOT_TOKEN_TEST", "TELEGRAM_BOT_TOKEN"):
+                v = os.getenv(env_key)
+                if v and v.strip():
+                    logger.info(
+                        "DEVELOPMENT_MODE: using Telegram token from %s (skipping Secret Manager)",
+                        env_key,
+                    )
+                    return v.strip()
+
         try:
             # Check if we're in test mode and use test secrets
-            if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+            if dev:
                 secret_name = f"{secret_name}-test"
             
             client = secretmanager.SecretManagerServiceClient()
@@ -153,6 +170,89 @@ class GCPTelegramBot:
         if not update.effective_chat:
             return False
         return update.effective_chat.type == Chat.PRIVATE
+
+    def _welcome_text(self, first_name: str) -> str:
+        return (
+            f"Welcome to AMBetz, {first_name}! 🎮🏀🏒⚾\n\n"
+            f"We provide premium betting tips and predictions for:\n"
+            f"• Esports\n"
+            f"• NBA\n"
+            f"• NHL\n"
+            f"• MLB\n"
+            f"• UCL\n"
+            f"• And much more!\n\n"
+            f"Join our VIP groups to get exclusive daily picks and maximize your winnings!"
+        )
+
+    @staticmethod
+    def _back_only_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        INLINE_BACK_BUTTON_TEXT, callback_data="menu_main"
+                    )
+                ]
+            ]
+        )
+
+    @staticmethod
+    def _keyboard_with_back(
+        markup: InlineKeyboardMarkup, back_callback: str = "menu_main"
+    ) -> InlineKeyboardMarkup:
+        rows = [list(row) for row in markup.inline_keyboard]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    INLINE_BACK_BUTTON_TEXT, callback_data=back_callback
+                )
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    async def _edit_menu_message(
+        self,
+        message,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        """Edit the single hub/menu message; no-op if content unchanged."""
+        try:
+            await message.edit_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                return
+            raise
+
+    async def _reply_private_ui(
+        self,
+        update: Update,
+        text: str,
+        *,
+        reply_markup: InlineKeyboardMarkup | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        """Reply to a command message, or edit the hub message when handling inline callbacks."""
+        if update.callback_query:
+            await self._edit_menu_message(
+                update.callback_query.message,
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+        else:
+            await update.effective_message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
 
     def build_main_menu_keyboard(self) -> InlineKeyboardMarkup:
         """Subscribe full width; other commands in two columns below."""
@@ -208,25 +308,34 @@ class GCPTelegramBot:
         if not success:
             logger.error(f"Failed to store user data for {user_id}")
         
-        # Check if user is eligible for free trial
-        # subscription = self.firestore_service.get_subscription(user_id)
-        # has_active_subscription = subscription and subscription.get('status') == 'active'
-        # has_used_trial = self.firestore_service.has_used_trial(user_id)
-        
+        text = self._welcome_text(first_name or "there")
         reply_markup = self.build_main_menu_keyboard()
-        
-        await update.message.reply_text(
-            f"Welcome to AMBetz, {first_name}! 🎮🏀🏒⚾\n\n"
-            f"We provide premium betting tips and predictions for:\n"
-            f"• Esports\n"
-            f"• NBA\n"
-            f"• NHL\n"
-            f"• MLB\n"
-            f"• UCL\n"
-            f"• And much more!\n\n"
-            f"Join our VIP groups to get exclusive daily picks and maximize your winnings!",
-            reply_markup=reply_markup
-        )
+        chat_id = update.effective_chat.id
+        hub_id = context.user_data.get("menu_message_id")
+
+        hub_reset = False
+        if hub_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=hub_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+                hub_reset = True
+            except BadRequest as e:
+                logger.info("Could not reuse hub message on /start, sending new: %s", e)
+                context.user_data.pop("menu_message_id", None)
+
+        if not hub_reset:
+            sent = await update.message.reply_text(
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            context.user_data["menu_message_id"] = sent.message_id
+
         logger.info(f"User {username} (ID: {user_id}) started the bot")
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,16 +379,22 @@ class GCPTelegramBot:
 
             if status == "expired":
                 keyboard = [[InlineKeyboardButton("Renew Subscription", callback_data="subscribe")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.effective_message.reply_text(
-                    message, reply_markup=reply_markup, parse_mode="Markdown"
+                reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(keyboard))
+                await self._reply_private_ui(
+                    update, message, reply_markup=reply_markup, parse_mode="Markdown"
                 )
             else:
-                await update.effective_message.reply_text(message, parse_mode="Markdown")
+                await self._reply_private_ui(
+                    update,
+                    message,
+                    reply_markup=self._back_only_markup(),
+                    parse_mode="Markdown",
+                )
         else:
             keyboard = [[InlineKeyboardButton("Subscribe Now", callback_data="subscribe")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.effective_message.reply_text(
+            reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(keyboard))
+            await self._reply_private_ui(
+                update,
                 "You don't have an active subscription. Subscribe now to get started!",
                 reply_markup=reply_markup,
             )
@@ -421,7 +536,10 @@ class GCPTelegramBot:
 *Need Help?*
 Contact AM if you have any questions about your subscription.
 """
-        await update.effective_message.reply_text(help_text, parse_mode="Markdown")
+        markup = self._back_only_markup() if update.callback_query else None
+        await self._reply_private_ui(
+            update, help_text, reply_markup=markup, parse_mode="Markdown"
+        )
 
     async def test_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Create a test subscription for the user (development purposes)."""
@@ -611,11 +729,18 @@ Contact AM if you have any questions about your subscription.
             # Check if user has an active subscription
             subscription = self.firestore_service.get_subscription(user_id)
             
+            cb_markup = (
+                self._back_only_markup() if update.callback_query else None
+            )
+
             if not subscription or subscription.get('status') != 'active':
-                await update.effective_message.reply_text(
+                await self._reply_private_ui(
+                    update,
                     "❌ **No Active Subscription Found**\n\n"
                     "You don't have an active subscription to cancel.\n\n"
-                    "Use /start to subscribe if you'd like to join VIP!"
+                    "Please subscribe if you'd like to join VIP!",
+                    reply_markup=cb_markup,
+                    parse_mode="Markdown",
                 )
                 return
             
@@ -623,20 +748,26 @@ Contact AM if you have any questions about your subscription.
             metadata = subscription.get('metadata', {})
             if metadata.get('cancelled'):
                 expiry_date = subscription.get('expiry_date')
-                await update.effective_message.reply_text(
+                await self._reply_private_ui(
+                    update,
                     f"⚠️ **Subscription Already Cancelled**\n\n"
                     f"Your subscription has already been cancelled and will expire on:\n"
                     f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
-                    f"You will continue to have VIP access until then."
+                    f"You will continue to have VIP access until then.",
+                    reply_markup=cb_markup,
+                    parse_mode="Markdown",
                 )
                 return
             
             # Get Stripe customer ID
             stripe_customer_id = subscription.get('stripe_customer_id')
             if not stripe_customer_id:
-                await update.effective_message.reply_text(
+                await self._reply_private_ui(
+                    update,
                     "❌ **Unable to Cancel Subscription**\n\n"
-                    "We couldn't find your Stripe customer information. Please contact support for assistance."
+                    "We couldn't find your Stripe customer information. Please contact support for assistance.",
+                    reply_markup=cb_markup,
+                    parse_mode="Markdown",
                 )
                 return
             
@@ -651,9 +782,12 @@ Contact AM if you have any questions about your subscription.
                     subscriptions = stripe.Subscription.list(customer=stripe_customer_id, status='trialing')
                 
                 if not subscriptions.data:
-                    await update.effective_message.reply_text(
+                    await self._reply_private_ui(
+                        update,
                         "❌ **No Active Stripe Subscription Found**\n\n"
-                        "We couldn't find an active subscription in Stripe. Please contact support."
+                        "We couldn't find an active subscription in Stripe. Please contact support.",
+                        reply_markup=cb_markup,
+                        parse_mode="Markdown",
                     )
                     return
                 
@@ -688,30 +822,45 @@ Contact AM if you have any questions about your subscription.
                 )
                 
                 if success:
-                    await update.effective_message.reply_text(
+                    await self._reply_private_ui(
+                        update,
                         f"✅ **Subscription Cancelled Successfully**\n\n"
                         f"Your subscription has been cancelled and will expire on:\n"
                         f"**{expiry_str}**\n\n"
                         f"You will continue to have VIP access until then.\n\n"
-                        f"Use /start to resubscribe when you're ready to return!"
+                        f"Use /start to resubscribe when you're ready to return!",
+                        reply_markup=cb_markup,
+                        parse_mode="Markdown",
                     )
                     logger.info(f"User {user_id} cancelled their subscription")
                 else:
-                    await update.effective_message.reply_text(
+                    await self._reply_private_ui(
+                        update,
                         "❌ **Error Cancelling Subscription**\n\n"
-                        "There was an error updating your subscription status. Please contact support."
+                        "There was an error updating your subscription status. Please contact support.",
+                        reply_markup=cb_markup,
+                        parse_mode="Markdown",
                     )
                 
             except Exception as e:
                 logger.error(f"Error cancelling Stripe subscription for user {user_id}: {e}")
-                await update.effective_message.reply_text(
+                await self._reply_private_ui(
+                    update,
                     "❌ **Error Cancelling Subscription**\n\n"
-                    "There was an error cancelling your subscription. Please contact support for assistance."
+                    "There was an error cancelling your subscription. Please contact support for assistance.",
+                    reply_markup=cb_markup,
+                    parse_mode="Markdown",
                 )
                 
         except Exception as e:
             logger.error(f"Error in cancel_command: {e}")
-            await update.effective_message.reply_text(f"❌ Error processing cancellation request: {e}")
+            await self._reply_private_ui(
+                update,
+                f"❌ Error processing cancellation request: {e}",
+                reply_markup=(
+                    self._back_only_markup() if update.callback_query else None
+                ),
+            )
 
     async def _reply_stripe_checkout_error(self, query, user_id: int, e: Exception) -> None:
         logger.error(
@@ -719,11 +868,15 @@ Contact AM if you have any questions about your subscription.
             extra={"telegram_id": user_id, "error": str(e)},
             exc_info=True,
         )
+        back = self._back_only_markup()
         if isinstance(e, ActiveSubscriptionExistsError):
-            await query.message.reply_text(str(e))
+            await self._edit_menu_message(
+                query.message, str(e), reply_markup=back
+            )
             return
         dev = os.getenv("DEVELOPMENT_MODE", "false").lower() == "true"
         msg = "❌ Sorry, there was an error processing your request. Please try again later."
+        parse_mode: str | None = None
         if dev:
             stripe_detail = (
                 (e.user_message or str(e)) if isinstance(e, StripeError) else str(e)
@@ -738,7 +891,10 @@ Contact AM if you have any questions about your subscription.
                     "`sk_test_` keys only work with prices from Stripe **Test mode**; "
                     "**live** price IDs require `sk_live_` keys (and vice versa)."
                 )
-        await query.message.reply_text(msg)
+                parse_mode = "Markdown"
+        await self._edit_menu_message(
+            query.message, msg, reply_markup=back, parse_mode=parse_mode
+        )
 
     async def _reply_subscription_checkout(
         self,
@@ -751,19 +907,24 @@ Contact AM if you have any questions about your subscription.
         existing_subscription = self._subscription_precheck_sync_stripe(user_id)
         if existing_subscription and existing_subscription.get("status") == "active":
             expiry_date = existing_subscription["expiry_date"]
-            await query.message.reply_text(
+            await self._edit_menu_message(
+                query.message,
                 f"❌ **Subscription Already Active**\n\n"
                 f"You already have an active subscription that expires on:\n"
                 f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
                 f"You cannot subscribe again until your current subscription expires.\n\n"
-                f"Use `/status` to check your current subscription."
+                f"Use `/status` to check your current subscription.",
+                reply_markup=self._back_only_markup(),
+                parse_mode="Markdown",
             )
             return
 
         if not self.stripe_service.is_configured:
-            await query.message.reply_text(
+            await self._edit_menu_message(
+                query.message,
                 "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
-                "For testing, you can use /test to create a test subscription."
+                "For testing, you can use /test to create a test subscription.",
+                reply_markup=self._back_only_markup(),
             )
             return
 
@@ -774,8 +935,9 @@ Contact AM if you have any questions about your subscription.
                 user_id, username, price_id=price_id
             )
             keyboard = [[InlineKeyboardButton("💳 Pay now", url=payment_url)]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.message.reply_text(
+            reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(keyboard))
+            await self._edit_menu_message(
+                query.message,
                 self._subscription_checkout_message_text(),
                 reply_markup=reply_markup,
                 parse_mode="Markdown",
@@ -794,19 +956,24 @@ Contact AM if you have any questions about your subscription.
         existing_subscription = self._subscription_precheck_sync_stripe(user_id)
         if existing_subscription and existing_subscription.get("status") == "active":
             expiry_date = existing_subscription["expiry_date"]
-            await query.message.reply_text(
+            await self._edit_menu_message(
+                query.message,
                 f"❌ **Subscription Already Active**\n\n"
                 f"You already have an active subscription that expires on:\n"
                 f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
                 f"You cannot subscribe again until your current subscription expires.\n\n"
-                f"Use `/status` to check your current subscription."
+                f"Use `/status` to check your current subscription.",
+                reply_markup=self._back_only_markup(),
+                parse_mode="Markdown",
             )
             return
 
         if not self.stripe_service.is_configured:
-            await query.message.reply_text(
+            await self._edit_menu_message(
+                query.message,
                 "This is the subscription flow. In production, this would connect to a payment provider.\n\n"
-                "For testing, you can use /test to create a test subscription."
+                "For testing, you can use /test to create a test subscription.",
+                reply_markup=self._back_only_markup(),
             )
             return
 
@@ -835,9 +1002,11 @@ Contact AM if you have any questions about your subscription.
             )
             return
 
-        await query.message.reply_text(
+        reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(rows))
+        await self._edit_menu_message(
+            query.message,
             self._subscription_checkout_message_text(),
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=reply_markup,
             parse_mode="Markdown",
         )
 
@@ -851,6 +1020,16 @@ Contact AM if you have any questions about your subscription.
         query = update.callback_query
         await query.answer()
         data = query.data
+
+        if data == "menu_main":
+            first_name = update.effective_user.first_name or "there"
+            await self._edit_menu_message(
+                query.message,
+                self._welcome_text(first_name),
+                reply_markup=self.build_main_menu_keyboard(),
+            )
+            context.user_data["menu_message_id"] = query.message.message_id
+            return
 
         if data == "menu_status":
             await self._send_status_reply(update, update.effective_user.id)
@@ -869,8 +1048,10 @@ Contact AM if you have any questions about your subscription.
             plan_key = data.split(":", 1)[1]
             price_id = self.stripe_service.price_id_for_plan_key(plan_key)
             if not price_id:
-                await query.message.reply_text(
-                    "That plan is not available. Please use /start and try Subscribe again."
+                await self._edit_menu_message(
+                    query.message,
+                    "That plan is not available. Please use /start and try Subscribe again.",
+                    reply_markup=self._back_only_markup(),
                 )
                 return
             user_id = update.effective_user.id
@@ -884,12 +1065,15 @@ Contact AM if you have any questions about your subscription.
             existing_subscription = self._subscription_precheck_sync_stripe(user_id)
             if existing_subscription and existing_subscription.get("status") == "active":
                 expiry_date = existing_subscription["expiry_date"]
-                await query.message.reply_text(
+                await self._edit_menu_message(
+                    query.message,
                     f"❌ **Subscription Already Active**\n\n"
                     f"You already have an active subscription that expires on:\n"
                     f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
                     f"You cannot subscribe again until your current subscription expires.\n\n"
-                    f"Use `/status` to check your current subscription."
+                    f"Use `/status` to check your current subscription.",
+                    reply_markup=self._back_only_markup(),
+                    parse_mode="Markdown",
                 )
                 return
 
@@ -914,22 +1098,28 @@ Contact AM if you have any questions about your subscription.
             # Check 1: Active subscription
             if existing_subscription and existing_subscription.get('status') == 'active':
                 expiry_date = existing_subscription['expiry_date']
-                await query.message.reply_text(
+                await self._edit_menu_message(
+                    query.message,
                     f"❌ **Already Have Active Access**\n\n"
                     f"You already have an active subscription that expires on:\n"
                     f"**{expiry_date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
                     f"You cannot start a trial while you have an active subscription.\n\n"
-                    f"Use `/status` to check your current subscription."
+                    f"Use `/status` to check your current subscription.",
+                    reply_markup=self._back_only_markup(),
+                    parse_mode="Markdown",
                 )
                 return
             
             # Check 2: Has used trial before
             has_used_trial = self.firestore_service.has_used_trial(user_id)
             if has_used_trial:
-                await query.message.reply_text(
+                await self._edit_menu_message(
+                    query.message,
                     f"❌ **Free Trial Already Used**\n\n"
                     f"You have already used your free trial. Free trials are limited to one per user.\n\n"
-                    f"Click the Subscribe button to get full VIP access with our monthly subscription!"
+                    f"Click the Subscribe button to get full VIP access with our monthly subscription!",
+                    reply_markup=self._back_only_markup(),
+                    parse_mode="Markdown",
                 )
                 return
             
@@ -944,9 +1134,10 @@ Contact AM if you have any questions about your subscription.
                     keyboard = [
                         [InlineKeyboardButton("🆓 Start Free Trial", url=trial_url)],
                     ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(keyboard))
                     
-                    await query.message.reply_text(
+                    await self._edit_menu_message(
+                        query.message,
                         "🆓 **Start Your 3-Day Free Trial!**\n\n"
                         "Click the button below to start your free trial. No credit card required until the trial ends!\n\n"
                         "✅ **3 days completely free**\n"
@@ -957,19 +1148,24 @@ Contact AM if you have any questions about your subscription.
                         "You can cancel anytime before the trial ends to avoid charges.\n\n"
                         "Subscription fees are non-refundable; cancel anytime to stop future charges.\n\n"
                         "⚠️ **Note:** You'll need to add a payment method to start the trial, but you won't be charged until after 3 days.",
-                        reply_markup=reply_markup
+                        reply_markup=reply_markup,
+                        parse_mode="Markdown",
                     )
                     
                 except Exception as e:
                     logger.error(f"Error creating trial link for user {user_id}: {e}", exc_info=True)
-                    await query.message.reply_text(
+                    await self._edit_menu_message(
+                        query.message,
                         f"❌ Sorry, there was an error processing your trial request.\n\n"
-                        f"Please try again later or contact support."
+                        f"Please try again later or contact support.",
+                        reply_markup=self._back_only_markup(),
                     )
             else:
                 # Stripe not configured - show message
-                await query.message.reply_text(
-                    "Trial subscriptions require Stripe to be configured. Please contact support."
+                await self._edit_menu_message(
+                    query.message,
+                    "Trial subscriptions require Stripe to be configured. Please contact support.",
+                    reply_markup=self._back_only_markup(),
                 )
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1045,7 +1241,10 @@ Contact AM if you have any questions about your subscription.
         if chat.username:
             info_message += f"**Username:** @{chat.username}\n"
         
-        await update.effective_message.reply_text(info_message, parse_mode="Markdown")
+        markup = self._back_only_markup() if update.callback_query else None
+        await self._reply_private_ui(
+            update, info_message, reply_markup=markup, parse_mode="Markdown"
+        )
         logger.info(f"Chat info requested for chat '{chat_title}' (ID: {chat_id})")
 
     async def check_expired_subscriptions(self, context: ContextTypes.DEFAULT_TYPE) -> None:

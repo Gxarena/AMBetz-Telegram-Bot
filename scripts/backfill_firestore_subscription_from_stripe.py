@@ -9,6 +9,9 @@ Subscription (latest current_period_end if several), then calls FirestoreService
 Usage (repo root):
   python3 scripts/backfill_firestore_subscription_from_stripe.py --telegram-id 6961106092
   python3 scripts/backfill_firestore_subscription_from_stripe.py --telegram-id 6961106092 --live
+  # Canceled subscription (no active/trialing pick):
+  python3 scripts/backfill_firestore_subscription_from_stripe.py --telegram-id 8046382574 \\
+      --stripe-subscription-id sub_1TIMQUF7amkBfz0LzhWAZr11 --live
 
 Requires:
   STRIPE_SECRET_KEY (must match Stripe mode: sk_live_* for production customers)
@@ -204,6 +207,16 @@ def main() -> int:
         action="store_true",
         help="Overwrite existing Firestore doc if status is already active.",
     )
+    parser.add_argument(
+        "--stripe-subscription-id",
+        type=str,
+        default=None,
+        metavar="sub_...",
+        help=(
+            "Backfill from this Stripe Subscription id (including canceled). "
+            "Customer must have metadata.telegram_id matching --telegram-id (or missing metadata with warning)."
+        ),
+    )
     args = parser.parse_args()
 
     tid = args.telegram_id
@@ -219,7 +232,12 @@ def main() -> int:
     stripe.api_key = secret
 
     from firestore_service import FirestoreService
-    from gcp_stripe_service import subscription_fallback_expiry
+    from gcp_stripe_service import (
+        _price_id_from_stripe_subscription,
+        expiry_from_invoice_recurring_prices,
+        subscription_fallback_expiry,
+    )
+    from stripe_compat import metadata_get
 
     fs = FirestoreService(project)
     existing = fs.get_subscription(tid)
@@ -232,36 +250,81 @@ def main() -> int:
         print(f"Current: expiry_date={existing.get('expiry_date')!r}", file=sys.stderr)
         return 1
 
-    print(f"Looking up Stripe customer with metadata telegram_id={tid} ...", flush=True)
-    res = stripe.Customer.search(query=f"metadata['telegram_id']:'{tid}'", limit=5)
-    if not res.data:
-        print(
-            "ERROR: No Stripe customer with metadata['telegram_id'] matching this user. "
-            "Check Stripe Dashboard → Customers → Metadata.",
-            file=sys.stderr,
-        )
-        return 1
-    if len(res.data) > 1:
-        print(
-            f"WARNING: Multiple Stripe customers share telegram_id {tid}; using first: {res.data[0].id}",
-            file=sys.stderr,
-        )
-    customer = res.data[0]
-    cust_id = customer.id
+    _exp = ["items.data", "items.data.price", "latest_invoice"]
 
-    sub, pick_note = _pick_subscription(cust_id)
-    if not sub:
-        print(f"ERROR: No active or trialing subscription for customer {cust_id}.", file=sys.stderr)
-        return 1
+    if args.stripe_subscription_id:
+        sid_arg = args.stripe_subscription_id.strip()
+        print(f"Loading subscription {sid_arg} ...", flush=True)
+        try:
+            sub = stripe.Subscription.retrieve(sid_arg, expand=_exp)
+        except Exception as exc:
+            print(f"ERROR: Subscription.retrieve({sid_arg}) failed: {exc}", file=sys.stderr)
+            return 1
+        sub_id = _stripe_field(sub, "id")
+        if not sub_id:
+            print("ERROR: Subscription has no id.", file=sys.stderr)
+            return 1
+        cust_raw = _stripe_field(sub, "customer")
+        cust_id = cust_raw if isinstance(cust_raw, str) else _stripe_field(cust_raw, "id")
+        if not cust_id:
+            print("ERROR: Subscription has no customer.", file=sys.stderr)
+            return 1
+        cust_full = stripe.Customer.retrieve(cust_id)
+        md_tid = metadata_get(cust_full.metadata, "telegram_id")
+        if md_tid is not None and str(md_tid).strip():
+            try:
+                if int(md_tid) != tid:
+                    print(
+                        f"ERROR: Customer {cust_id} metadata telegram_id={md_tid!r} "
+                        f"does not match --telegram-id {tid}.",
+                        file=sys.stderr,
+                    )
+                    return 1
+            except ValueError:
+                print(
+                    f"ERROR: Customer {cust_id} has non-numeric telegram_id in metadata: {md_tid!r}.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            print(
+                f"WARNING: Customer {cust_id} has no metadata telegram_id; "
+                f"verify this subscription belongs to telegram_id {tid}.",
+                file=sys.stderr,
+            )
+        pick_note = "explicit_stripe_subscription_id"
+    else:
+        print(f"Looking up Stripe customer with metadata telegram_id={tid} ...", flush=True)
+        res = stripe.Customer.search(query=f"metadata['telegram_id']:'{tid}'", limit=5)
+        if not res.data:
+            print(
+                "ERROR: No Stripe customer with metadata['telegram_id'] matching this user. "
+                "Check Stripe Dashboard → Customers → Metadata.",
+                file=sys.stderr,
+            )
+            return 1
+        if len(res.data) > 1:
+            print(
+                f"WARNING: Multiple Stripe customers share telegram_id {tid}; using first: {res.data[0].id}",
+                file=sys.stderr,
+            )
+        customer = res.data[0]
+        cust_id = customer.id
 
-    # Fresh retrieve so line items/periods are always expanded (avoids list() stub objects).
-    sub_id = _stripe_field(sub, "id")
-    if not sub_id:
-        print("ERROR: Subscription has no id.", file=sys.stderr)
-        return 1
-    sub = stripe.Subscription.retrieve(
-        sub_id, expand=["items.data", "items.data.price", "latest_invoice"]
-    )
+        picked, pick_note = _pick_subscription(cust_id)
+        if not picked:
+            print(
+                f"ERROR: No active or trialing subscription for customer {cust_id}. "
+                f"Pass --stripe-subscription-id sub_... for canceled or past subscriptions.",
+                file=sys.stderr,
+            )
+            return 1
+
+        sub_id = _stripe_field(picked, "id")
+        if not sub_id:
+            print("ERROR: Subscription has no id.", file=sys.stderr)
+            return 1
+        sub = stripe.Subscription.retrieve(sub_id, expand=_exp)
 
     status = (getattr(sub, "status", None) or _stripe_field(sub, "status") or "") or ""
     cps, cpe = _period_bounds_unix(sub)
@@ -281,17 +344,41 @@ def main() -> int:
     else:
         # Same heuristic as gcp_stripe_service.subscription_fallback_expiry (recurring-aware)
         created = _stripe_field(sub, "created")
-        if created is not None and status in ("active", "trialing"):
+        if created is not None:
             start_dt = datetime.fromtimestamp(int(created), tz=timezone.utc)
             is_tr = status == "trialing"
-            end_dt = subscription_fallback_expiry(sub, start_dt, is_trial=is_tr)
+            inv_obj = None
+            latest = _stripe_field(sub, "latest_invoice")
+            if latest:
+                inv_id = latest if isinstance(latest, str) else _stripe_field(latest, "id")
+                if inv_id:
+                    try:
+                        inv_obj = stripe.Invoice.retrieve(
+                            str(inv_id), expand=["lines.data.price"]
+                        )
+                    except Exception as exc:
+                        print(
+                            f"WARNING: Could not load latest_invoice {inv_id} for price-based expiry: {exc}",
+                            file=sys.stderr,
+                        )
+            end_dt = subscription_fallback_expiry(
+                sub, start_dt, is_trial=is_tr, invoice=inv_obj
+            )
+            if end_dt is None and inv_obj is not None:
+                end_dt = expiry_from_invoice_recurring_prices(inv_obj, start_dt)
             sub_type = "trial" if is_tr else "premium"
             period_fallback = True
             print(
-                "WARNING: Using subscription.created + recurring/trial fallback for period "
+                "WARNING: Using subscription.created + price/recurring fallback for period "
                 "(API did not return item periods). Verify expiry in Stripe Dashboard.",
                 file=sys.stderr,
             )
+            if end_dt is None:
+                print(
+                    "ERROR: Could not derive expiry from subscription items or invoice line prices.",
+                    file=sys.stderr,
+                )
+                return 1
         else:
             print(
                 f"ERROR: Could not derive period or trial bounds for {sub_id}. "
@@ -301,6 +388,7 @@ def main() -> int:
             return 1
 
     amount, currency = _amount_currency(sub)
+    stripe_price_id = _price_id_from_stripe_subscription(sub)
 
     # Reference id: prefer latest invoice id (matches recurring webhook style); else subscription id
     session_ref: Optional[str] = None
@@ -336,12 +424,19 @@ def main() -> int:
         stripe_customer_id=cust_id,
         stripe_session_id=session_ref,
         stripe_subscription_id=sub_id,
+        stripe_price_id=stripe_price_id,
         amount_paid=amount,
         currency=currency,
     )
     if not ok:
         print("ERROR: upsert_subscription returned False.", file=sys.stderr)
         return 1
+    if status == "canceled":
+        fs.mark_subscription_expired(tid)
+        print(
+            "Stripe subscription status=canceled → Firestore status set to expired (dates above are the billed period).",
+            flush=True,
+        )
     print("", flush=True)
     print(f"OK: Firestore subscriptions/{tid} written.", flush=True)
     print(

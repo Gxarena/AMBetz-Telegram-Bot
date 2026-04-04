@@ -14,8 +14,11 @@ from telegram import Update
 from firestore_service import FirestoreService
 from gcp_stripe_service import (
     GCPStripeService,
+    _invoice_period_bounds_unix,
     _price_id_from_stripe_subscription,
+    _subscription_id_from_invoice,
     _subscription_period_bounds_unix,
+    expiry_from_invoice_recurring_prices,
     subscription_fallback_expiry,
 )
 from stripe_compat import metadata_get
@@ -540,71 +543,117 @@ async def handle_recurring_payment(invoice):
                 logger.warning(f"No subscription found in Firestore for customer {customer_id}. Skipping webhook processing.")
                 return
         
-        # Try to get subscription ID from invoice
-        subscription_id = getattr(invoice, 'subscription', None)
-        
-        # If no subscription ID at top level, try to extract from line items
-        if not subscription_id and hasattr(invoice, 'lines') and invoice.lines:
-            try:
-                # Try to get subscription from first line item's parent field
-                if hasattr(invoice.lines, 'data') and len(invoice.lines.data) > 0:
-                    first_line = invoice.lines.data[0]
-                    line_dict = dict(first_line)
-                    
-                    # Check parent -> subscription_item_details -> subscription
-                    if 'parent' in line_dict and isinstance(line_dict['parent'], dict):
-                        parent = line_dict['parent']
-                        if 'subscription_item_details' in parent and isinstance(parent['subscription_item_details'], dict):
-                            sub_id = parent['subscription_item_details'].get('subscription')
-                            if sub_id:
-                                subscription_id = sub_id
-                                logger.info(f"Found subscription ID in line item parent: {subscription_id}")
-            except Exception as e:
-                logger.warning(f"Could not extract subscription from line items: {e}")
-        
-        # Calculate subscription dates
+        subscription_id = _subscription_id_from_invoice(invoice)
+        if subscription_id:
+            logger.info(f"Resolved subscription id for invoice {invoice.id}: {subscription_id}")
+
         from datetime import datetime, timedelta
-        
-        # If we have a subscription ID, use it to get accurate period dates
+
         recurring_price_id = None
+        subscription_obj = None
         if subscription_id:
             try:
-                subscription = stripe.Subscription.retrieve(
+                subscription_obj = stripe.Subscription.retrieve(
                     subscription_id, expand=["items.data", "items.data.price"]
                 )
-                recurring_price_id = _price_id_from_stripe_subscription(subscription)
-                cps, cpe = _subscription_period_bounds_unix(subscription)
-                if cps is not None and cpe is not None:
-                    current_period_start = datetime.fromtimestamp(cps, tz=pytz.UTC)
-                    current_period_end = datetime.fromtimestamp(cpe, tz=pytz.UTC)
-                else:
-                    logger.warning(
-                        f"Subscription {subscription_id} has no period bounds; "
-                        f"using invoice date start + price.recurring fallback (or 30d)"
-                    )
-                    invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
-                    current_period_start = invoice_date
-                    is_tr = getattr(subscription, "status", None) == "trialing"
-                    current_period_end = subscription_fallback_expiry(
-                        subscription, invoice_date, is_trial=is_tr
-                    )
+                recurring_price_id = _price_id_from_stripe_subscription(subscription_obj)
             except Exception as e:
-                logger.warning(f"Could not retrieve subscription {subscription_id}: {e}, using invoice date + 30 days")
-                # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
-                invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
-                current_period_start = invoice_date
-                current_period_end = invoice_date + timedelta(days=30)
-        else:
-            # No subscription ID found - treat as one-time payment
-            logger.info(f"No subscription ID found for invoice {invoice.id} - treating as one-time 30-day payment")
-            # Stripe timestamps are in UTC, make timezone-aware for Firestore compatibility
+                logger.warning(
+                    "Could not retrieve subscription %s for invoice %s: %s",
+                    subscription_id,
+                    invoice.id,
+                    e,
+                )
+
+        cps: Optional[int] = None
+        cpe: Optional[int] = None
+        if subscription_obj is not None:
+            cps, cpe = _subscription_period_bounds_unix(subscription_obj)
+
+        if cps is None or cpe is None:
+            ips, ipe = _invoice_period_bounds_unix(invoice)
+            if ips is not None and ipe is not None:
+                cps, cpe = ips, ipe
+                logger.info(
+                    "Invoice %s: using period from invoice / line items (%s → %s)",
+                    invoice.id,
+                    cps,
+                    cpe,
+                )
+
+        if cps is not None and cpe is not None:
+            current_period_start = datetime.fromtimestamp(cps, tz=pytz.UTC)
+            current_period_end = datetime.fromtimestamp(cpe, tz=pytz.UTC)
+        elif subscription_obj is not None:
+            logger.warning(
+                "Subscription %s + invoice %s missing period bounds after invoice fallback; "
+                "using subscription created + price.recurring",
+                subscription_id,
+                invoice.id,
+            )
+            cr = getattr(subscription_obj, "created", None)
+            if cr is not None:
+                current_period_start = datetime.fromtimestamp(int(cr), tz=pytz.UTC)
+            else:
+                current_period_start = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
+            is_tr = getattr(subscription_obj, "status", None) == "trialing"
+            current_period_end = subscription_fallback_expiry(
+                subscription_obj, current_period_start, is_trial=is_tr, invoice=invoice
+            )
+            if current_period_end is None:
+                current_period_end = expiry_from_invoice_recurring_prices(
+                    invoice, current_period_start
+                )
+            if current_period_end is None:
+                logger.error(
+                    "Cannot derive expiry from subscription %s or invoice %s line prices; skipping Firestore upsert",
+                    subscription_id,
+                    invoice.id,
+                )
+                return
+        elif subscription_id:
+            logger.warning(
+                "Subscription %s could not be loaded for invoice %s; deriving expiry from invoice/subscription prices",
+                subscription_id,
+                invoice.id,
+            )
             invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
             current_period_start = invoice_date
-            current_period_end = invoice_date + timedelta(days=30)
-            subscription_id = None  # Explicitly set to None
-        
-        # Check if this was a trial conversion (first payment after trial)
-        # If the previous subscription was a trial, mark user as having used trial
+            current_period_end = expiry_from_invoice_recurring_prices(invoice, invoice_date)
+            if current_period_end is None:
+                try:
+                    sub_min = stripe.Subscription.retrieve(
+                        subscription_id, expand=["items.data", "items.data.price"]
+                    )
+                    current_period_end = subscription_fallback_expiry(
+                        sub_min, invoice_date, is_trial=False, invoice=invoice
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Subscription.retrieve(%s) failed in invoice fallback: %s",
+                        subscription_id,
+                        e,
+                    )
+            if current_period_end is None:
+                logger.error(
+                    "No expiry derived for invoice %s (subscription %s unloadable); skipping Firestore upsert",
+                    invoice.id,
+                    subscription_id,
+                )
+                return
+        else:
+            logger.info(
+                f"No subscription ID on invoice {invoice.id} — using recurring price on lines "
+                f"or ONE_TIME_CHECKOUT_ACCESS_DAYS fallback"
+            )
+            subscription_id = None
+            invoice_date = datetime.fromtimestamp(invoice.created, tz=pytz.UTC)
+            current_period_start = invoice_date
+            current_period_end = expiry_from_invoice_recurring_prices(invoice, invoice_date)
+            if current_period_end is None:
+                days = int(os.getenv("ONE_TIME_CHECKOUT_ACCESS_DAYS", "30"))
+                current_period_end = invoice_date + timedelta(days=days)
+
         existing_subscription = firestore_service.get_subscription(int(telegram_id))
         was_trial = False
         if existing_subscription:
@@ -613,15 +662,19 @@ async def handle_recurring_payment(invoice):
                          isinstance(existing_subscription['metadata'], dict) and 
                          existing_subscription['metadata'].get('is_trial')))
         
-        # Update subscription in Firestore
+        stripe_session_ref = invoice.id
+        prev_sess = (existing_subscription or {}).get("stripe_session_id")
+        if isinstance(prev_sess, str) and prev_sess.startswith("cs_"):
+            stripe_session_ref = prev_sess
+
         success = firestore_service.upsert_subscription(
             telegram_id=int(telegram_id),
             start_date=current_period_start,
             expiry_date=current_period_end,
             subscription_type="premium",
             stripe_customer_id=customer_id,
-            stripe_session_id=invoice.id,  # Use invoice ID as reference
-            stripe_subscription_id=subscription_id,  # May be None for one-time payments
+            stripe_session_id=stripe_session_ref,
+            stripe_subscription_id=subscription_id,
             stripe_price_id=recurring_price_id,
             amount_paid=invoice.amount_paid / 100,  # Convert from cents
             currency=invoice.currency
@@ -635,18 +688,24 @@ async def handle_recurring_payment(invoice):
             
             logger.info(f"Updated recurring subscription for user {telegram_id}, expiry: {current_period_end}")
             
-            # Notify user about successful renewal
-            try:
-                bot_app = await get_bot_application()
-                await bot_app.bot.send_message(
-                    chat_id=int(telegram_id),
-                    text=f"✅ **Subscription Renewed Successfully!**\n\n"
-                         f"Your VIP subscription has been renewed and will remain active until:\n"
-                         f"**{current_period_end.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
-                         f"Thank you for your continued support! 🎉"
+            billing_reason = getattr(invoice, "billing_reason", None)
+            if billing_reason != "subscription_create":
+                try:
+                    bot_app = await get_bot_application()
+                    await bot_app.bot.send_message(
+                        chat_id=int(telegram_id),
+                        text=f"✅ **Subscription Renewed Successfully!**\n\n"
+                             f"Your VIP subscription has been renewed and will remain active until:\n"
+                             f"**{current_period_end.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+                             f"Thank you for your continued support! 🎉"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send renewal notification to user {telegram_id}: {e}")
+            else:
+                logger.info(
+                    "Skipping renewal DM for invoice %s (billing_reason=subscription_create; checkout welcome handles first purchase)",
+                    invoice.id,
                 )
-            except Exception as e:
-                logger.error(f"Failed to send renewal notification to user {telegram_id}: {e}")
         else:
             logger.error(f"Failed to update recurring subscription for user {telegram_id}")
             
