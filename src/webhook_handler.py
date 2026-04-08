@@ -949,8 +949,30 @@ async def handle_payment_failed(invoice):
     try:
         logger.info(f"Processing failed payment for invoice: {invoice.id}")
         
-        # Get subscription from invoice
-        subscription_id = getattr(invoice, 'subscription', None)
+        # Same resolution as handle_recurring_payment — some webhook/API shapes omit
+        # invoice.subscription and only put the id on line items. On API versions such as
+        # 2025-04-30.basil, invoice.payment_failed often sends a thin payload with no lines;
+        # re-fetch the invoice so subscription id is present.
+        subscription_id = _subscription_id_from_invoice(invoice)
+        if not subscription_id:
+            try:
+                inv_full = stripe.Invoice.retrieve(
+                    invoice.id,
+                    expand=["subscription", "lines.data"],
+                )
+                subscription_id = _subscription_id_from_invoice(inv_full)
+                if subscription_id:
+                    logger.info(
+                        "Resolved subscription id after invoice re-fetch %s: %s",
+                        invoice.id,
+                        subscription_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not re-fetch invoice %s to resolve subscription: %s",
+                    invoice.id,
+                    e,
+                )
         if not subscription_id:
             logger.warning(f"No subscription ID in invoice {invoice.id} - likely a one-time payment")
             return
