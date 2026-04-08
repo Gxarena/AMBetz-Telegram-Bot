@@ -20,6 +20,30 @@ class ActiveSubscriptionExistsError(ValueError):
     pass
 
 
+def _subscription_item_period_bounds_unix(it0: Any) -> Tuple[Optional[int], Optional[int]]:
+    """current_period_start/end on one subscription item (flexible / per-item billing)."""
+    cs = ce = None
+    if isinstance(it0, dict):
+        cs, ce = it0.get("current_period_start"), it0.get("current_period_end")
+    else:
+        cs = getattr(it0, "current_period_start", None)
+        ce = getattr(it0, "current_period_end", None)
+        if cs is None or ce is None:
+            try:
+                if cs is None:
+                    cs = it0["current_period_start"]
+                if ce is None:
+                    ce = it0["current_period_end"]
+            except (KeyError, TypeError):
+                pass
+    if cs is None or ce is None:
+        return None, None
+    try:
+        return int(cs), int(ce)
+    except (TypeError, ValueError):
+        return None, None
+
+
 def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[int]]:
     """
     current_period_start/end on Subscription, or from first line item if Stripe omits top-level
@@ -35,20 +59,45 @@ def _subscription_period_bounds_unix(sub: Any) -> Tuple[Optional[int], Optional[
             return int(cs), int(ce)
     except (TypeError, ValueError):
         pass
-    items_obj = sub.get("items") if hasattr(sub, "get") else None
+    items_obj = None
+    try:
+        items_obj = sub["items"]
+    except (KeyError, TypeError, AttributeError):
+        if hasattr(sub, "get"):
+            try:
+                items_obj = sub.get("items")
+            except Exception:
+                items_obj = None
+        if items_obj is None:
+            items_obj = getattr(sub, "items", None)
+            if callable(items_obj):
+                items_obj = None
+    if items_obj is None:
+        return None, None
     data = None
-    if items_obj is not None:
-        data = items_obj.get("data") if hasattr(items_obj, "get") else getattr(items_obj, "data", None)
+    if isinstance(items_obj, dict):
+        data = items_obj.get("data")
+    else:
+        data = getattr(items_obj, "data", None)
+        if data is None:
+            try:
+                data = items_obj["data"]
+            except (KeyError, TypeError):
+                pass
     if not data:
         return None, None
+    best_end: int = -1
+    best_pair: Tuple[Optional[int], Optional[int]] = (None, None)
     for it0 in data:
         try:
-            cs = it0.get("current_period_start") if hasattr(it0, "get") else getattr(it0, "current_period_start", None)
-            ce = it0.get("current_period_end") if hasattr(it0, "get") else getattr(it0, "current_period_end", None)
-            if cs is not None and ce is not None:
-                return int(cs), int(ce)
+            csa, ceb = _subscription_item_period_bounds_unix(it0)
+            if csa is not None and ceb is not None and ceb > best_end:
+                best_end = ceb
+                best_pair = (csa, ceb)
         except (TypeError, ValueError, IndexError):
             continue
+    if best_pair[0] is not None and best_pair[1] is not None:
+        return best_pair
     return None, None
 
 
@@ -171,6 +220,8 @@ def _subscription_id_from_invoice(invoice: Any) -> Optional[str]:
     Resolve Subscription id from an Invoice (top-level or line-item shapes).
     Stripe Checkout's first paid invoice usually has invoice.subscription set;
     some API/webhook shapes only embed the id under line items.
+    API 2025-04-30.basil often puts the id on invoice.parent.subscription_details.subscription
+    instead of invoice.subscription.
     """
     sid = _sget(invoice, "subscription")
     if sid:
@@ -178,6 +229,17 @@ def _subscription_id_from_invoice(invoice: Any) -> Optional[str]:
             return sid
         pid = _sget(sid, "id")
         return str(pid) if pid else None
+
+    inv_parent = _sget(invoice, "parent")
+    if inv_parent is not None:
+        sub_details = _sget(inv_parent, "subscription_details")
+        if sub_details is not None:
+            psub = _sget(sub_details, "subscription")
+            if psub:
+                if isinstance(psub, str):
+                    return psub
+                pid = _sget(psub, "id")
+                return str(pid) if pid else None
 
     lines = _sget(invoice, "lines")
     data = _sget(lines, "data") if lines is not None else None
@@ -193,17 +255,12 @@ def _subscription_id_from_invoice(invoice: Any) -> Optional[str]:
             if pid:
                 return str(pid)
         parent = _sget(line, "parent")
-        if isinstance(parent, dict):
-            sidetails = parent.get("subscription_item_details")
-            if isinstance(sidetails, dict):
-                sub = sidetails.get("subscription")
+        if parent is not None:
+            sidetails = _sget(parent, "subscription_item_details")
+            if sidetails is not None:
+                sub = _sget(sidetails, "subscription")
                 if sub:
-                    return str(sub)
-        if isinstance(line, dict):
-            pd = line.get("parent") or {}
-            sidetails = pd.get("subscription_item_details") if isinstance(pd, dict) else None
-            if isinstance(sidetails, dict) and sidetails.get("subscription"):
-                return str(sidetails["subscription"])
+                    return str(sub) if isinstance(sub, str) else str(_sget(sub, "id") or sub)
     return None
 
 
