@@ -203,14 +203,27 @@ class FirestoreService:
 
     def find_expired_subscriptions(self) -> List[Dict]:
         """
-        Find all subscriptions that have expired based on current UTC time
-        
+        Subscriptions for which the VIP expirer should run: billing period is over, but we
+        may still need to remove the user in Telegram and sync Firestore.
+
+        Includes (1) status still *active* with expiry in the past, and (2) status *expired*
+        with expiry in the past but within a recent lookback window. Case (2) exists because
+        webhooks (e.g. customer.subscription.deleted) often set status to *expired* before the
+        scheduled job would have seen *active* + past expiry; those users would otherwise never
+        be picked up for ban/unban. Stripe refresh in the kick path remains the source of truth
+        for still-paying customers.
+
         Returns:
-            List[Dict]: List of expired subscriptions
+            List[Dict]: Deduplicated subscription dicts
         """
         try:
             # Use timezone-aware datetime for Firestore query compatibility
             current_time = datetime.now(pytz.UTC)
+            # Firestore *expired* with billing end in this window: catches webhook/cron
+            # races (status flipped to *expired* before ban ran). We keep the window short so
+            # we do not re-ban+unban the same stragglers on every run for many months; older
+            # gaps are rare and can be fixed with a one-off POST /check-expired or manual kick.
+            stale_lookback = current_time - timedelta(days=30)
             
             # Find subscriptions where expiry_date is less than current time
             # and status is still "active"
@@ -218,7 +231,7 @@ class FirestoreService:
                     .where(filter=FieldFilter('expiry_date', '<', current_time))
                     .where(filter=FieldFilter('status', '==', 'active')))
             
-            expired = []
+            expired: List[Dict] = []
             for doc in query.stream():
                 sub_data = doc.to_dict()
                 sub_data['telegram_id'] = int(doc.id)  # Ensure telegram_id is available
@@ -258,10 +271,44 @@ class FirestoreService:
                         else:
                             logger.warning(f"User {sub_data['telegram_id']} has recurring subscription but expired even with grace period - may need manual check")
                 
+                sub_data['expire_reason'] = 'active_past_expiry'
                 expired.append(sub_data)
+
+            # Already marked *expired* in Firestore but period ended in the lookback — may
+            # have missed a Telegram remove when the webhook set status before the cron could.
+            q_stale = (
+                self.db.collection("subscriptions")
+                .where(filter=FieldFilter("status", "==", "expired"))
+                .where(filter=FieldFilter("expiry_date", ">", stale_lookback))
+                .where(filter=FieldFilter("expiry_date", "<", current_time))
+            )
+            try:
+                for doc in q_stale.stream():
+                    sub_data = doc.to_dict()
+                    tid = int(doc.id)
+                    sub_data["telegram_id"] = tid
+                    expiry_date = sub_data.get("expiry_date")
+                    if expiry_date and expiry_date.tzinfo is None:
+                        expiry_date = pytz.UTC.localize(expiry_date)
+                        sub_data["expiry_date"] = expiry_date
+                    sub_data["expire_reason"] = "firestore_expired_telegram_maybe_stale"
+                    expired.append(sub_data)
+            except Exception as e:
+                logger.error(
+                    "Stale-expired Firestore query failed (add a composite index on "
+                    "subscriptions: status, expiry_date if the console suggests): %s",
+                    e,
+                )
             
-            logger.info(f"Found {len(expired)} expired subscriptions")
-            return expired
+            by_tid: Dict[int, Dict] = {}
+            for sub_data in expired:
+                by_tid[int(sub_data["telegram_id"])] = sub_data
+            out = list(by_tid.values())
+            logger.info(
+                "find_expired_subscriptions: %s candidates (incl. stale expired rows within lookback)",
+                len(out),
+            )
+            return out
         except Exception as e:
             logger.error(f"Error finding expired subscriptions: {e}")
             return []

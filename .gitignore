@@ -147,4 +147,9 @@ logs/
 
 # Temporary files
 *.tmp
-*.temp 
+*.temp
+
+# Local Stripe CLI binary (optional; downloaded outside Homebrew)
+tools/stripe-cli/
+
+.cursor/
