@@ -1291,6 +1291,7 @@ async def check_expired_subscriptions():
                 except Exception as e:
                     logger.error(f"Failed to send admin notifications: {e}")
                 
+                firestore_service.mark_vip_removal_completed(telegram_id)
                 kicked_count += 1
                 logger.info(f"Successfully processed expired subscription for user {display_name} ({telegram_id})")
                 

@@ -1340,6 +1340,8 @@ Contact AM if you have any questions about your subscription.
                             logger.error(f"Could not notify user {telegram_id} about removal: {e}")
                     except Exception as e:
                         logger.error(f"Failed to remove user {telegram_id} from VIP discussion group: {e}")
+
+                self.firestore_service.mark_vip_removal_completed(telegram_id)
         except Exception as e:
             logger.error(f"Error in check_expired_subscriptions: {e}")
 

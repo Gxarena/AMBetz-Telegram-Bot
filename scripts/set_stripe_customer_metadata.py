@@ -15,6 +15,7 @@ Requires: STRIPE_SECRET_KEY in .env (live vs test must match the Customer).
 Usage:
   python3 scripts/set_stripe_customer_metadata.py --customer cus_XXX --telegram-id 123 --live
   python3 scripts/set_stripe_customer_metadata.py --customer cus_XXX --telegram-id 123 --meta note=manual
+  python3 scripts/set_stripe_customer_metadata.py --customer cus_XXX --telegram-id 5880689445 --telegram-username abath3r --name \"AB\" --live
 """
 
 from __future__ import annotations
@@ -89,6 +90,11 @@ def main() -> int:
         metavar="KEY=VALUE",
         help="Extra metadata pair (repeatable).",
     )
+    p.add_argument(
+        "--name",
+        default="",
+        help="Set Stripe Customer name (display; e.g. 'AB' for first-name-only). Merged on live modify.",
+    )
     p.add_argument("--live", action="store_true", help="Call Stripe Customer.modify.")
     args = p.parse_args()
 
@@ -133,8 +139,13 @@ def main() -> int:
         print("\nDRY-RUN: pass --live to apply.", flush=True)
         return 0
 
-    stripe.Customer.modify(cus, metadata=merged)
-    print("\nOK: Stripe Customer metadata updated.", flush=True)
+    kwargs: Dict[str, Any] = {"metadata": merged}
+    if args.name.strip():
+        kwargs["name"] = args.name.strip()
+        print(f"  setting name: {args.name.strip()!r}", flush=True)
+
+    stripe.Customer.modify(cus, **kwargs)
+    print("\nOK: Stripe Customer updated.", flush=True)
     return 0
 
 

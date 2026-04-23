@@ -4,10 +4,15 @@ import pytz
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from google.cloud import firestore
+from google.cloud.firestore import DELETE_FIELD
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Set on subscriptions after the VIP kick path has run once, so find_expired_subscriptions
+# does not re-queue the same "stale expired" row on every cron run.
+VIP_REMOVAL_COMPLETED_AT = "vip_removal_completed_at"
 
 class FirestoreService:
     def __init__(self, project_id: str = None):
@@ -207,11 +212,13 @@ class FirestoreService:
         may still need to remove the user in Telegram and sync Firestore.
 
         Includes (1) status still *active* with expiry in the past, and (2) status *expired*
-        with expiry in the past but within a recent lookback window. Case (2) exists because
-        webhooks (e.g. customer.subscription.deleted) often set status to *expired* before the
+        with expiry in the past but within a recent lookback window and no
+        ``vip_removal_completed_at`` yet. Case (2) exists because webhooks (e.g.
+        customer.subscription.deleted) often set status to *expired* before the
         scheduled job would have seen *active* + past expiry; those users would otherwise never
-        be picked up for ban/unban. Stripe refresh in the kick path remains the source of truth
-        for still-paying customers.
+        be picked up for ban/unban. After the kick path runs, we set ``vip_removal_completed_at`` so
+        the same user is not reprocessed daily. Stripe refresh in the kick path remains the
+        source of truth for still-paying customers.
 
         Returns:
             List[Dict]: Deduplicated subscription dicts
@@ -285,6 +292,8 @@ class FirestoreService:
             try:
                 for doc in q_stale.stream():
                     sub_data = doc.to_dict()
+                    if sub_data.get(VIP_REMOVAL_COMPLETED_AT):
+                        continue
                     tid = int(doc.id)
                     sub_data["telegram_id"] = tid
                     expiry_date = sub_data.get("expiry_date")
@@ -335,6 +344,25 @@ class FirestoreService:
             logger.error(f"Error marking subscription expired for user {telegram_id}: {e}")
             return False
 
+    def mark_vip_removal_completed(self, telegram_id: int) -> bool:
+        """
+        Record that the automated VIP kick path has run for this user. Prevents
+        find_expired_subscriptions from re-queuing "stale expired" rows on every cron run.
+        """
+        try:
+            doc_ref = self.db.collection("subscriptions").document(str(telegram_id))
+            doc_ref.update(
+                {
+                    VIP_REMOVAL_COMPLETED_AT: datetime.now(pytz.UTC),
+                    "updated_at": datetime.utcnow(),
+                }
+            )
+            logger.info(f"Recorded VIP removal completed for user {telegram_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error recording VIP removal for user {telegram_id}: {e}")
+            return False
+
     def sync_subscription_active_from_stripe(
         self,
         telegram_id: int,
@@ -362,6 +390,7 @@ class FirestoreService:
             }
             if stripe_price_id:
                 upd["stripe_price_id"] = stripe_price_id
+            upd[VIP_REMOVAL_COMPLETED_AT] = DELETE_FIELD
             doc_ref.update(upd)
             logger.info(
                 "Synced subscriptions/%s from Stripe (active, expiry=%s)",
