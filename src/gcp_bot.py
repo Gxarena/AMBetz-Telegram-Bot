@@ -1063,6 +1063,15 @@ Contact AM if you have any questions about your subscription.
         self._orphan_stripe_cancel_if_still_expired(user_id)
 
         try:
+            await self._edit_menu_message(
+                query.message,
+                "Opening secure Stripe checkout…",
+                reply_markup=self._back_only_markup(),
+            )
+        except Exception:
+            pass
+
+        try:
             payment_url = self.stripe_service.create_subscription_checkout(
                 user_id, username, price_id=price_id
             )
@@ -1086,8 +1095,8 @@ Contact AM if you have any questions about your subscription.
         *,
         include_mentorship: bool = False,
     ) -> None:
-        """Single message: intro text + one Stripe Checkout URL button per plan."""
-        existing_subscription = self._subscription_precheck_sync_stripe(user_id)
+        """Plan picker only — Stripe Checkout is created after the user taps a plan."""
+        existing_subscription = self.firestore_service.get_subscription(user_id)
         if (
             existing_subscription
             and existing_subscription.get("status") == "active"
@@ -1115,47 +1124,36 @@ Contact AM if you have any questions about your subscription.
             )
             return
 
-        self._orphan_stripe_cancel_if_still_expired(user_id)
-
         rows: list = []
-        first_error: Exception | None = None
         skip_recurring = bool(
             existing_subscription and existing_subscription.get("status") == "active"
         )
         if not skip_recurring:
             for p in plans:
-                try:
-                    url = self.stripe_service.create_subscription_checkout(
-                        user_id, username, price_id=p["price_id"]
-                    )
-                    rows.append([InlineKeyboardButton(f"💳 {p['label']}", url=url)])
-                except Exception as e:
-                    if first_error is None:
-                        first_error = e
-                    logger.error(
-                        "Checkout session failed for plan %s",
-                        p.get("key"),
-                        exc_info=True,
-                    )
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            f"💳 {p['label']}",
+                            callback_data=f"subscribe_plan:{p['key']}",
+                        )
+                    ]
+                )
 
         if include_mentorship:
-            try:
-                murl = self.stripe_service.create_mentorship_checkout(user_id, username)
-                rows.append(
-                    [InlineKeyboardButton("🎯 Mentorship — $850 (one-time payment)", url=murl)]
-                )
-            except MentorshipUnavailableError as e:
-                if first_error is None:
-                    first_error = e
-                logger.info("Mentorship checkout unavailable: %s", e)
-            except Exception as e:
-                if first_error is None:
-                    first_error = e
-                logger.error("Mentorship checkout session failed", exc_info=True)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🎯 Mentorship — $850 (one-time payment)",
+                        callback_data="subscribe_mentorship",
+                    )
+                ]
+            )
 
         if not rows:
-            await self._reply_stripe_checkout_error(
-                query, user_id, first_error or Exception("Checkout unavailable")
+            await self._edit_menu_message(
+                query.message,
+                "No plans are available right now. Please try again later.",
+                reply_markup=self._back_only_markup(),
             )
             return
 
@@ -1194,6 +1192,14 @@ Contact AM if you have any questions about your subscription.
                 reply_markup=self._back_only_markup(),
             )
             return
+        try:
+            await self._edit_menu_message(
+                query.message,
+                "Opening secure Stripe checkout…",
+                reply_markup=self._back_only_markup(),
+            )
+        except Exception:
+            pass
         try:
             payment_url = self.stripe_service.create_mentorship_checkout(user_id, username)
             keyboard = [
@@ -1256,6 +1262,12 @@ Contact AM if you have any questions about your subscription.
             user_id = update.effective_user.id
             username = update.effective_user.username
             await self._reply_subscription_checkout(query, user_id, username, price_id)
+            return
+
+        if data == "subscribe_mentorship":
+            user_id = update.effective_user.id
+            username = update.effective_user.username
+            await self._reply_mentorship_checkout(query, user_id, username)
             return
 
         if data == "subscribe":
