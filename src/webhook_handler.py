@@ -477,8 +477,10 @@ async def stripe_webhook(request: Request):
                             logger.info(f"Marked user {subscription_data['telegram_id']} as having used a trial")
                         
                         bot_app = await get_bot_application()
-                        telegram_bot_instance = GCPTelegramBot()
-                        telegram_bot_instance.application = bot_app
+                        telegram_bot_instance = telegram_bot
+                        if telegram_bot_instance is None:
+                            telegram_bot_instance = GCPTelegramBot()
+                            telegram_bot_instance.application = bot_app
                         tid = int(subscription_data["telegram_id"])
                         uname = subscription_data.get("telegram_username")
 

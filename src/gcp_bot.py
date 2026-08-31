@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 from google.cloud import logging as cloud_logging
-from google.cloud import secretmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -28,6 +27,7 @@ from gcp_stripe_service import (
     GCPStripeService,
     MentorshipUnavailableError,
 )
+from secret_access import access_secret
 
 # Setup Cloud Logging (only on Cloud Run — locally use console logging; avoids wrong quota project from ADC)
 def _running_on_cloud_run() -> bool:
@@ -136,38 +136,37 @@ class GCPTelegramBot:
             # Check if we're in test mode and use test secrets
             if dev:
                 secret_name = f"{secret_name}-test"
-            
-            client = secretmanager.SecretManagerServiceClient()
-            name = f"projects/{self.project_id}/secrets/{secret_name}/versions/latest"
-            response = client.access_secret_version(request={"name": name})
-            return response.payload.data.decode("UTF-8")
-        except Exception as e:
-            logger.error(f"Error accessing secret {secret_name}: {e}")
-            key = secret_name.upper().replace("-", "_")
-            val = os.getenv(key)
+
+            val = access_secret(self.project_id, secret_name)
             if val:
                 return val
-            if os.getenv("DEVELOPMENT_MODE", "false").lower() == "true" and secret_name.endswith(
-                "-test"
-            ):
-                base = secret_name[: -len("-test")]
-                val2 = os.getenv(base.upper().replace("-", "_"))
-                if val2:
-                    return val2
-            # DEVELOPMENT_MODE=false expects TELEGRAM_BOT_TOKEN; many local .env files only set TELEGRAM_BOT_TOKEN_TEST
-            if (
-                not val
-                and os.getenv("DEVELOPMENT_MODE", "false").lower() != "true"
-                and secret_name == "telegram-bot-token"
-            ):
-                alt = os.getenv("TELEGRAM_BOT_TOKEN_TEST")
-                if alt:
-                    logger.warning(
-                        "TELEGRAM_BOT_TOKEN is unset; using TELEGRAM_BOT_TOKEN_TEST. "
-                        "Set TELEGRAM_BOT_TOKEN for production-style local runs."
-                    )
-                    return alt
-            return val or ""
+        except Exception as e:
+            logger.error(f"Error accessing secret {secret_name}: {e}")
+
+        key = secret_name.upper().replace("-", "_")
+        val = os.getenv(key)
+        if val:
+            return val
+        if os.getenv("DEVELOPMENT_MODE", "false").lower() == "true" and secret_name.endswith(
+            "-test"
+        ):
+            base = secret_name[: -len("-test")]
+            val2 = os.getenv(base.upper().replace("-", "_"))
+            if val2:
+                return val2
+        # DEVELOPMENT_MODE=false expects TELEGRAM_BOT_TOKEN; many local .env files only set TELEGRAM_BOT_TOKEN_TEST
+        if (
+            os.getenv("DEVELOPMENT_MODE", "false").lower() != "true"
+            and secret_name == "telegram-bot-token"
+        ):
+            alt = os.getenv("TELEGRAM_BOT_TOKEN_TEST")
+            if alt:
+                logger.warning(
+                    "TELEGRAM_BOT_TOKEN is unset; using TELEGRAM_BOT_TOKEN_TEST. "
+                    "Set TELEGRAM_BOT_TOKEN for production-style local runs."
+                )
+                return alt
+        return val or ""
 
     def _is_private_chat(self, update: Update) -> bool:
         """Check if the current chat is a private chat (PM)"""

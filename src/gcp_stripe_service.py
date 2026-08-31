@@ -8,9 +8,9 @@ import pytz
 from typing import Any, Dict, List, Optional, Tuple
 from calendar import monthrange
 from datetime import datetime, timedelta
-from google.cloud import secretmanager
 
 from firestore_service import MENTORSHIP_EXPIRY_SENTINEL, is_mentorship_lifetime
+from secret_access import access_secret
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -518,9 +518,6 @@ class GCPStripeService:
         if not self.project_id:
             raise ValueError("GOOGLE_CLOUD_PROJECT environment variable is required")
         
-        # Initialize Secret Manager client
-        self.secret_client = secretmanager.SecretManagerServiceClient()
-        
         # Get Stripe credentials from Secret Manager
         self.publishable_key = self._get_secret("stripe-publishable-key")
         self.secret_key = self._get_secret("stripe-secret-key")
@@ -834,12 +831,12 @@ class GCPStripeService:
                 return v
 
         try:
-            name = f"projects/{self.project_id}/secrets/{secret_name}/versions/latest"
-            response = self.secret_client.access_secret_version(request={"name": name})
-            return response.payload.data.decode("UTF-8")
+            val = access_secret(self.project_id, secret_name)
+            if val:
+                return val
         except Exception as e:
             logger.error(f"Error accessing secret {secret_name}: {e}")
-            return self._env_lookup_for_secret_id(secret_name) or ""
+        return self._env_lookup_for_secret_id(secret_name) or ""
 
     def create_payment_link(self, telegram_id: int, telegram_username: str = None, price_id: str = None) -> str:
         """Create a Stripe payment link for a user"""
