@@ -281,12 +281,12 @@ class GCPTelegramBot:
         """Shared copy for checkout (single, multi-plan, or mentorship)."""
         if mentorship_only:
             return (
-                "🎯 **Mentorship — $850 one-time** (10 spots only)\n\n"
+                "🎯 **Mentorship — $850 one-time**\n\n"
                 "This is **not** a recurring subscription. If you already have a VIP plan, "
                 "we cancel future charges after you pay.\n\n"
                 "✅ VIP access with no automatic removal\n"
                 "✅ Admins remove members from the chats manually\n\n"
-                "Fees are non-refundable unless the 10 spots are already filled."
+                "Fees are non-refundable unless this package is already sold out."
             )
         text = (
             "🎉 **Choose your plan** and pay securely through Stripe.\n\n"
@@ -299,7 +299,7 @@ class GCPTelegramBot:
         )
         if include_mentorship:
             text += (
-                "\n\n🎯 **Mentorship** is a separate **$850 one-time** package (10 spots). "
+                "\n\n🎯 **Mentorship** is a separate **$850 one-time** package. "
                 "It does not auto-renew. If you buy it while you still have a recurring plan, "
                 "we stop future charges."
             )
@@ -1142,7 +1142,7 @@ Contact AM if you have any questions about your subscription.
             try:
                 murl = self.stripe_service.create_mentorship_checkout(user_id, username)
                 rows.append(
-                    [InlineKeyboardButton("🎯 Mentorship — $850", url=murl)]
+                    [InlineKeyboardButton("🎯 Mentorship — $850 (one-time payment)", url=murl)]
                 )
             except MentorshipUnavailableError as e:
                 if first_error is None:
@@ -1190,14 +1190,14 @@ Contact AM if you have any questions about your subscription.
         if self.firestore_service.mentorship_spots_remaining() <= 0:
             await self._edit_menu_message(
                 query.message,
-                "Mentorship is sold out (10 spots).",
+                "Mentorship is sold out.",
                 reply_markup=self._back_only_markup(),
             )
             return
         try:
             payment_url = self.stripe_service.create_mentorship_checkout(user_id, username)
             keyboard = [
-                [InlineKeyboardButton("🎯 Mentorship — $850", url=payment_url)]
+                [InlineKeyboardButton("🎯 Mentorship — $850 (one-time payment)", url=payment_url)]
             ]
             reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(keyboard))
             await self._edit_menu_message(

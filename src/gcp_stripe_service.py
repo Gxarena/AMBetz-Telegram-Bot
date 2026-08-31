@@ -617,7 +617,7 @@ class GCPStripeService:
         return {
             "key": "mentorship",
             "price_id": self.price_id_mentorship,
-            "label": "Mentorship — $850",
+            "label": "Mentorship — $850 (one-time payment)",
             "status_label": "Mentorship",
         }
 
