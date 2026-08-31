@@ -10,12 +10,20 @@ from calendar import monthrange
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
 
+from firestore_service import MENTORSHIP_EXPIRY_SENTINEL, is_mentorship_lifetime
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
 
 class ActiveSubscriptionExistsError(ValueError):
     """Raised when Stripe already has a subscription that blocks creating a new paid checkout."""
+
+    pass
+
+
+class MentorshipUnavailableError(ValueError):
+    """Raised when the mentorship package cannot be purchased (sold out or already owned)."""
 
     pass
 
@@ -119,7 +127,7 @@ def _price_id_from_obj(obj: Any) -> Optional[str]:
 
 
 def _price_id_from_stripe_subscription(sub: Any) -> Optional[str]:
-    """Stripe Price id from the first subscription item (week / 2wk / month plan)."""
+    """Stripe Price id from the first subscription item (week / 2wk / month / longer plans)."""
     items = getattr(sub, "items", None)
     if items is None and hasattr(sub, "get"):
         items = sub.get("items")
@@ -518,9 +526,13 @@ class GCPStripeService:
         self.secret_key = self._get_secret("stripe-secret-key")
         self.webhook_secret = self._get_secret("stripe-webhook-secret")
         self.price_id = self._get_secret("stripe-price-id")
-        # Optional shorter billing periods (same Stripe product, different recurring prices)
+        # Optional extra billing periods (same Stripe product, different recurring prices)
         self.price_id_week = (self._get_secret("stripe-price-id-week") or "").strip()
         self.price_id_2week = (self._get_secret("stripe-price-id-2week") or "").strip()
+        self.price_id_3month = (self._get_secret("stripe-price-id-3month") or "").strip()
+        self.price_id_6month = (self._get_secret("stripe-price-id-6month") or "").strip()
+        self.price_id_year = (self._get_secret("stripe-price-id-year") or "").strip()
+        self.price_id_mentorship = (self._get_secret("stripe-price-id-mentorship") or "").strip()
         
         # Check if Stripe is configured
         self.is_configured = bool(self.secret_key)
@@ -539,22 +551,114 @@ class GCPStripeService:
     def get_subscription_plan_options(self) -> List[Dict[str, str]]:
         """
         Plans shown in the bot after the user taps Subscribe.
-        Keys: week, 2week, month — must match callback_data subscribe_plan:<key>.
+        Keys must match callback_data subscribe_plan:<key>.
         """
         plans: List[Dict[str, str]] = []
         if self.price_id_week:
             plans.append(
-                {"key": "week", "price_id": self.price_id_week, "label": "1 week — $35"}
+                {
+                    "key": "week",
+                    "price_id": self.price_id_week,
+                    "label": "1 week — $35",
+                    "status_label": "1 week",
+                }
             )
         if self.price_id_2week:
             plans.append(
-                {"key": "2week", "price_id": self.price_id_2week, "label": "2 weeks — $50"}
+                {
+                    "key": "2week",
+                    "price_id": self.price_id_2week,
+                    "label": "2 weeks — $50",
+                    "status_label": "2 weeks",
+                }
             )
         if self.price_id:
             plans.append(
-                {"key": "month", "price_id": self.price_id, "label": "1 month — $75"}
+                {
+                    "key": "month",
+                    "price_id": self.price_id,
+                    "label": "1 month — $75",
+                    "status_label": "1 month",
+                }
+            )
+        if self.price_id_3month:
+            plans.append(
+                {
+                    "key": "3month",
+                    "price_id": self.price_id_3month,
+                    "label": "3 months — $200",
+                    "status_label": "3 months",
+                }
+            )
+        if self.price_id_6month:
+            plans.append(
+                {
+                    "key": "6month",
+                    "price_id": self.price_id_6month,
+                    "label": "6 months — $350",
+                    "status_label": "6 months",
+                }
+            )
+        if self.price_id_year:
+            plans.append(
+                {
+                    "key": "year",
+                    "price_id": self.price_id_year,
+                    "label": "1 year — $600",
+                    "status_label": "1 year",
+                }
             )
         return plans
+
+    def get_mentorship_plan_option(self) -> Optional[Dict[str, str]]:
+        """One-time $850 mentorship (not a recurring Subscribe plan)."""
+        if not self.price_id_mentorship:
+            return None
+        return {
+            "key": "mentorship",
+            "price_id": self.price_id_mentorship,
+            "label": "Mentorship — $850",
+            "status_label": "Mentorship",
+        }
+
+    def session_is_mentorship(self, session: Any) -> bool:
+        if metadata_get(getattr(session, "metadata", None), "offer") == "mentorship":
+            return True
+        if getattr(session, "mode", None) == "payment" and self.price_id_mentorship:
+            pid = self._price_id_from_checkout_session(session)
+            return pid == self.price_id_mentorship
+        return False
+
+    def _price_id_from_checkout_session(self, session: Any) -> Optional[str]:
+        line_items = getattr(session, "line_items", None)
+        li_data = None
+        if line_items is not None:
+            li_data = getattr(line_items, "data", None) or (
+                line_items.get("data") if hasattr(line_items, "get") else None
+            )
+        if li_data:
+            it0 = li_data[0]
+            pr = getattr(it0, "price", None) if not isinstance(it0, dict) else it0.get("price")
+            pid = _price_id_from_obj(pr) if pr else None
+            if pid:
+                return pid
+        sid = getattr(session, "id", None) or (
+            session.get("id") if isinstance(session, dict) else None
+        )
+        if not sid or not self.is_configured:
+            return None
+        try:
+            full = stripe.checkout.Session.retrieve(
+                str(sid), expand=["line_items.data.price"]
+            )
+            items = getattr(full, "line_items", None)
+            data = getattr(items, "data", None) if items is not None else None
+            if data:
+                pr = getattr(data[0], "price", None)
+                return _price_id_from_obj(pr)
+        except Exception as exc:
+            logger.warning("Could not resolve price from checkout session %s: %s", sid, exc)
+        return None
 
     def price_id_for_plan_key(self, plan_key: str) -> Optional[str]:
         for p in self.get_subscription_plan_options():
@@ -815,7 +919,60 @@ class GCPStripeService:
         except Exception as e:
             logger.error(f"Error creating subscription checkout: {e}")
             raise
-    
+
+    def create_mentorship_checkout(
+        self, telegram_id: int, telegram_username: str = None
+    ) -> str:
+        """One-time Checkout for the limited mentorship package (mode=payment)."""
+        if not self.is_configured:
+            raise ValueError("Stripe is not configured")
+        if not self.price_id_mentorship:
+            raise ValueError("No mentorship Stripe price ID configured")
+
+        sanitized_username = (
+            self._sanitize_string(telegram_username) if telegram_username else ""
+        )
+        customer = self.get_or_create_customer(
+            telegram_id, sanitized_username, allow_active_subscription=True
+        )
+        self.cancel_terminal_and_incomplete_subscriptions(customer.id)
+
+        checkout_session = stripe.checkout.Session.create(
+            customer=customer.id,
+            line_items=[{"price": self.price_id_mentorship, "quantity": 1}],
+            mode="payment",
+            success_url="https://t.me/AMBETZBot?start=success",
+            cancel_url="https://t.me/AMBETZBot?start=cancelled",
+            metadata={
+                "telegram_id": str(telegram_id),
+                "telegram_username": sanitized_username,
+                "source": "gcp-bot",
+                "offer": "mentorship",
+            },
+        )
+        logger.info("Mentorship checkout session created for user %s", telegram_id)
+        return checkout_session.url
+
+    def refund_checkout_session(self, session: Any) -> bool:
+        """Refund a completed Checkout payment (used if mentorship is already sold out)."""
+        pi = getattr(session, "payment_intent", None)
+        if not pi and isinstance(session, dict):
+            pi = session.get("payment_intent")
+        pi_id = pi if isinstance(pi, str) else getattr(pi, "id", None)
+        if not pi_id:
+            logger.error(
+                "refund_checkout_session: no payment_intent on session %s",
+                getattr(session, "id", "?"),
+            )
+            return False
+        try:
+            stripe.Refund.create(payment_intent=str(pi_id))
+            logger.info("Refunded payment_intent %s for sold-out mentorship", pi_id)
+            return True
+        except stripe.StripeError as exc:
+            logger.error("Refund failed for payment_intent %s: %s", pi_id, exc)
+            return False
+
     def create_trial_subscription_checkout(self, telegram_id: int, telegram_username: str = None, trial_days: int = 3) -> str:
         """Create a Stripe checkout session for subscription with free trial period"""
         if not self.is_configured:
@@ -866,7 +1023,13 @@ class GCPStripeService:
             logger.error(f"Error creating trial subscription checkout: {e}")
             raise
     
-    def get_or_create_customer(self, telegram_id: int, telegram_username: str = None) -> stripe.Customer:
+    def get_or_create_customer(
+        self,
+        telegram_id: int,
+        telegram_username: str = None,
+        *,
+        allow_active_subscription: bool = False,
+    ) -> stripe.Customer:
         """Get existing customer or create new one"""
         if not self.is_configured:
             raise ValueError("Stripe is not configured")
@@ -894,7 +1057,7 @@ class GCPStripeService:
                         # Period already ended - treat as over (Stripe may not have sent deleted yet)
                         continue
                     truly_active.append(sub)
-                if truly_active:
+                if truly_active and not allow_active_subscription:
                     # Customer has a real active subscription - block duplicate
                     logger.warning(f"Customer {customer_id} already has active subscription, rejecting new subscription attempt")
                     raise ActiveSubscriptionExistsError(
@@ -1007,6 +1170,12 @@ class GCPStripeService:
             return False
         try:
             existing = firestore_service.get_subscription(telegram_id)
+            if is_mentorship_lifetime(existing):
+                logger.info(
+                    "try_refresh_firestore_mirror_from_stripe: skip mentorship user telegram_id=%s",
+                    telegram_id,
+                )
+                return False
             customer_id = (existing or {}).get("stripe_customer_id")
             sub_id_from_doc = (existing or {}).get("stripe_subscription_id")
 
@@ -1217,6 +1386,9 @@ class GCPStripeService:
         if st == "trial":
             logger.info("%s subscription_type trial -> Free trial", log_pfx)
             return "Free trial"
+        if st == "mentorship" or (isinstance(meta, dict) and meta.get("is_mentorship")):
+            logger.info("%s mentorship -> Mentorship", log_pfx)
+            return "Mentorship"
 
         pid = doc.get("stripe_price_id")
         sub_id = doc.get("stripe_subscription_id")
@@ -1242,16 +1414,9 @@ class GCPStripeService:
             logger.info("%s matching price_id=%r against configured=%s", log_pfx, pid, configured)
             for p in opts:
                 if p["price_id"] == pid:
-                    key = p["key"]
-                    if key == "week":
-                        logger.info("%s secret match -> 1 week", log_pfx)
-                        return "1 week"
-                    if key == "2week":
-                        logger.info("%s secret match -> 2 weeks", log_pfx)
-                        return "2 weeks"
-                    if key == "month":
-                        logger.info("%s secret match -> 1 month", log_pfx)
-                        return "1 month"
+                    label = p.get("status_label") or p.get("label") or p.get("key")
+                    logger.info("%s secret match -> %s", log_pfx, label)
+                    return label
             api_label = _plan_label_from_stripe_price_id(str(pid))
             logger.info(
                 "%s no secret match; Stripe Price API label=%r for price_id=%r",
@@ -1398,6 +1563,7 @@ class GCPStripeService:
 
             subscription_object = None
             is_trial = False
+            is_mentorship = False
 
             # For subscriptions, get the actual subscription period from Stripe
             if hasattr(session_data, 'subscription') and session_data.subscription:
@@ -1478,7 +1644,15 @@ class GCPStripeService:
             else:
                 # One-time payment (no subscription on session): duration from Price if present, else env.
                 start_date = datetime.now(pytz.UTC)
-                if os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
+                is_mentorship = metadata_get(metadata, "offer") == "mentorship"
+                if not is_mentorship and self.price_id_mentorship:
+                    is_mentorship = (
+                        self._price_id_from_checkout_session(session_data)
+                        == self.price_id_mentorship
+                    )
+                if is_mentorship:
+                    expiry_date = MENTORSHIP_EXPIRY_SENTINEL
+                elif os.getenv('DEVELOPMENT_MODE', 'false').lower() == 'true':
                     expiry_date = start_date + timedelta(minutes=1)
                 else:
                     expiry_date = None
@@ -1523,6 +1697,13 @@ class GCPStripeService:
             if is_trial:
                 metadata_dict["is_trial"] = True
                 metadata_dict["trial_started_at"] = datetime.utcnow().isoformat()
+            if is_mentorship:
+                subscription_type = "mentorship"
+                metadata_dict = {
+                    "is_mentorship": True,
+                    "no_auto_kick": True,
+                    "offer": "mentorship",
+                }
             
             subscription_data = {
                 "telegram_id": int(telegram_id),
@@ -1553,8 +1734,15 @@ class GCPStripeService:
                             removed,
                             customer_id,
                         )
+            elif is_mentorship and self.price_id_mentorship:
+                subscription_data["stripe_price_id"] = self.price_id_mentorship
 
-            if is_trial:
+            if is_mentorship:
+                logger.info(
+                    "Mentorship payment processed for telegram user %s (no auto-kick)",
+                    telegram_id,
+                )
+            elif is_trial:
                 logger.info(f"Trial subscription processed for telegram user {telegram_id}, expires at {expiry_date}")
             else:
                 logger.info(f"Payment processed for telegram user {telegram_id}")

@@ -11,11 +11,12 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import stripe
 from telegram import Update
-from firestore_service import FirestoreService
+from firestore_service import FirestoreService, is_mentorship_lifetime
 from gcp_stripe_service import (
     GCPStripeService,
     _invoice_period_bounds_unix,
     _price_id_from_stripe_subscription,
+    _price_ids_from_invoice_line,
     _subscription_id_from_invoice,
     _subscription_period_bounds_unix,
     expiry_from_invoice_recurring_prices,
@@ -27,7 +28,7 @@ from webhook_validator import WebhookValidator
 import json
 from datetime import datetime, timedelta
 from google.cloud import secretmanager
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -213,6 +214,7 @@ async def stripe_webhook(request: Request):
             logger.info(f"Event data type: {type(event.data)}")
             logger.info(f"Event data object type: {type(event.data.object)}")
             
+            is_mentorship_session = False
             try:
                 session = event.data.object
                 logger.info(f"Session object type: {type(session)}")
@@ -250,11 +252,18 @@ async def stripe_webhook(request: Request):
                     logger.info(f"Session {session_id} already processed, skipping duplicate")
                     return JSONResponse(content={"status": "success", "message": "already_processed"})
 
+                is_mentorship_session = stripe_service.session_is_mentorship(session)
+
                 # Already VIP in Firestore but user completed another Checkout (e.g. bookmarked link).
+                # Mentorship is allowed on top of an active recurring plan (we cancel the sub after).
                 # Must run before handle_successful_payment — that path calls cancel_other_subscriptions_except
                 # and would cancel their valid subscription before we block the Firestore update.
                 prior_vip = firestore_service.get_subscription(telegram_id_val)
-                if prior_vip and prior_vip.get("status") == "active":
+                if (
+                    not is_mentorship_session
+                    and prior_vip
+                    and prior_vip.get("status") == "active"
+                ):
                     prior_session = prior_vip.get("stripe_session_id")
                     if prior_session != session_id:
                         logger.warning(
@@ -303,9 +312,17 @@ async def stripe_webhook(request: Request):
                 raise
             
             if subscription_data:
+                is_mentorship = (
+                    is_mentorship_session
+                    or subscription_data.get("subscription_type") == "mentorship"
+                )
                 # Check if user already has an active subscription
                 existing_subscription = firestore_service.get_subscription(subscription_data['telegram_id'])
-                if existing_subscription and existing_subscription.get('status') == 'active':
+                if (
+                    existing_subscription
+                    and existing_subscription.get('status') == 'active'
+                    and not is_mentorship
+                ):
                     tid = subscription_data['telegram_id']
                     logger.warning(
                         "User attempted to subscribe while already active - blocking",
@@ -349,6 +366,55 @@ async def stripe_webhook(request: Request):
                 
                 # Save subscription to Firestore
                 try:
+                    if is_mentorship:
+                        claim = firestore_service.claim_mentorship_spot(
+                            int(subscription_data["telegram_id"]),
+                            session_id,
+                        )
+                        if claim in ("sold_out", "duplicate_payment"):
+                            logger.warning(
+                                "Mentorship checkout rejected (%s) telegram_id=%s session=%s",
+                                claim,
+                                subscription_data["telegram_id"],
+                                session_id,
+                            )
+                            stripe_service.refund_checkout_session(session)
+                            try:
+                                bot_app = await get_bot_application()
+                                if claim == "sold_out":
+                                    text = (
+                                        "❌ **Mentorship is sold out**\n\n"
+                                        "This package is limited to 10 people. Your payment has been refunded."
+                                    )
+                                else:
+                                    text = (
+                                        "❌ **Mentorship already purchased**\n\n"
+                                        "You already have the mentorship package. "
+                                        "This extra payment has been refunded."
+                                    )
+                                await bot_app.bot.send_message(
+                                    chat_id=int(subscription_data["telegram_id"]),
+                                    text=text,
+                                    parse_mode="Markdown",
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "Failed to send mentorship rejected message: %s", e
+                                )
+                            return JSONResponse(
+                                content={
+                                    "status": "success",
+                                    "message": f"mentorship_{claim}_refunded",
+                                }
+                            )
+
+                    had_recurring = bool(
+                        existing_subscription
+                        and existing_subscription.get("status") == "active"
+                        and existing_subscription.get("stripe_subscription_id")
+                        and not is_mentorship_lifetime(existing_subscription)
+                    )
+
                     success = firestore_service.upsert_subscription(
                         telegram_id=subscription_data['telegram_id'],
                         start_date=subscription_data['start_date'],
@@ -380,6 +446,28 @@ async def stripe_webhook(request: Request):
                                     cust_id,
                                 )
 
+                        cancelled_recurring = False
+                        if is_mentorship:
+                            try:
+                                cancelled_recurring = bool(
+                                    stripe_service.cancel_active_subscriptions(
+                                        int(subscription_data["telegram_id"])
+                                    )
+                                )
+                                logger.info(
+                                    "Cancelled recurring Stripe subscription(s) after mentorship "
+                                    "purchase telegram_id=%s cancelled=%s prior_recurring=%s",
+                                    subscription_data["telegram_id"],
+                                    cancelled_recurring,
+                                    had_recurring,
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "Failed to cancel recurring subs after mentorship: %s",
+                                    e,
+                                    exc_info=True,
+                                )
+
                         # Check if this is a trial subscription
                         is_trial = subscription_data.get('subscription_type') == 'trial' or (subscription_data.get('metadata') and subscription_data['metadata'].get('is_trial'))
                         
@@ -388,25 +476,64 @@ async def stripe_webhook(request: Request):
                             firestore_service.mark_trial_used(subscription_data['telegram_id'])
                             logger.info(f"Marked user {subscription_data['telegram_id']} as having used a trial")
                         
+                        bot_app = await get_bot_application()
+                        telegram_bot_instance = GCPTelegramBot()
+                        telegram_bot_instance.application = bot_app
+                        tid = int(subscription_data["telegram_id"])
+                        uname = subscription_data.get("telegram_username")
+
+                        extra_admin_lines: List[str] = []
+                        if is_mentorship:
+                            offer = firestore_service.get_mentorship_offer()
+                            extra_admin_lines = [
+                                f"Spots used: {offer.get('sold_count', 0)}/{offer.get('max_spots', 10)}",
+                                "Recurring subscription cancelled: "
+                                f"{'yes' if (had_recurring or cancelled_recurring) else 'no'}",
+                                "No automatic kick — remove them from VIP chats manually.",
+                            ]
+
                         # Send welcome message and invite links
                         try:
-                            bot_app = await get_bot_application()
-                            telegram_bot_instance = GCPTelegramBot()
-                            telegram_bot_instance.application = bot_app
-                            
-                            # Generate and send invite links
-                            invite_links = await telegram_bot_instance.generate_one_time_invite_links(
-                                subscription_data['telegram_id'],
-                                subscription_data.get('telegram_username')
-                            )
+
+                            keys_needed: Set[str] = set()
+                            slots: list = []
+                            if telegram_bot_instance.vip_announcements_id:
+                                slots.append(
+                                    ("announcements", telegram_bot_instance.vip_announcements_id)
+                                )
+                            if telegram_bot_instance.vip_discussion_id:
+                                slots.append(
+                                    ("discussion", telegram_bot_instance.vip_discussion_id)
+                                )
+                            if is_mentorship and slots:
+                                seen_cids: set = set()
+                                for key, cid in slots:
+                                    if cid in seen_cids:
+                                        continue
+                                    seen_cids.add(cid)
+                                    present = await telegram_bot_instance._user_is_present_in_vip_chat(
+                                        cid, tid
+                                    )
+                                    if present is not True:
+                                        keys_needed.add(key)
+                            elif not is_mentorship:
+                                keys_needed = None  # all configured chats
+
+                            invite_links = {}
+                            if keys_needed is None or keys_needed:
+                                invite_links = await telegram_bot_instance.generate_one_time_invite_links(
+                                    tid,
+                                    uname,
+                                    only_keys=keys_needed,
+                                )
                             
                             if invite_links:
                                 await telegram_bot_instance.send_vip_invite_links(
-                                    subscription_data['telegram_id'],
+                                    tid,
                                     invite_links,
-                                    subscription_data.get('telegram_username')
+                                    uname,
                                 )
-                            else:
+                            elif not is_mentorship:
                                 logger.error(
                                     "VIP_INVITE_LINKS: checkout completed but no links to send "
                                     "(see VIP_INVITE_LINKS logs above) telegram_id=%s stripe_session_id=%s",
@@ -414,8 +541,25 @@ async def stripe_webhook(request: Request):
                                     subscription_data.get("stripe_session_id"),
                                 )
                             
-                            # Send trial-specific message if applicable
-                            if is_trial:
+                            if is_mentorship:
+                                billing_note = (
+                                    "Your recurring VIP subscription has been cancelled — "
+                                    "you will not be charged again.\n\n"
+                                    if (had_recurring or cancelled_recurring)
+                                    else ""
+                                )
+                                await bot_app.bot.send_message(
+                                    chat_id=tid,
+                                    text=(
+                                        "🎉 **Mentorship package activated!**\n\n"
+                                        f"{billing_note}"
+                                        "This is a one-time payment. You keep VIP access until "
+                                        "an admin removes you from the groups — there is no automatic kick.\n\n"
+                                        "Use `/status` anytime."
+                                    ),
+                                    parse_mode="Markdown",
+                                )
+                            elif is_trial:
                                 await bot_app.bot.send_message(
                                     chat_id=subscription_data['telegram_id'],
                                     text=f"🎉 **Free Trial Started!**\n\n"
@@ -430,6 +574,34 @@ async def stripe_webhook(request: Request):
                                 "VIP_INVITE_LINKS: welcome/invite block failed telegram_id=%s stripe_session_id=%s: %s",
                                 subscription_data.get("telegram_id"),
                                 subscription_data.get("stripe_session_id"),
+                                e,
+                                exc_info=True,
+                            )
+
+                        try:
+                            if is_mentorship:
+                                payment_kind = "mentorship"
+                            elif is_trial:
+                                payment_kind = "trial"
+                            else:
+                                payment_kind = "subscription"
+                            plan_label = stripe_service.plan_display_for_subscription_doc(
+                                subscription_data, telegram_id=tid
+                            )
+                            await telegram_bot_instance.notify_admin_new_payment(
+                                tid,
+                                username=uname,
+                                plan_label=plan_label,
+                                payment_kind=payment_kind,
+                                amount_paid=subscription_data.get("amount_paid"),
+                                currency=subscription_data.get("currency"),
+                                expiry_date=subscription_data.get("expiry_date"),
+                                extra_lines=extra_admin_lines or None,
+                            )
+                        except Exception as e:
+                            logger.error(
+                                "Failed to send new-payment admin notification telegram_id=%s: %s",
+                                subscription_data.get("telegram_id"),
                                 e,
                                 exc_info=True,
                             )
@@ -542,6 +714,27 @@ async def handle_recurring_payment(invoice):
             else:
                 logger.warning(f"No subscription found in Firestore for customer {customer_id}. Skipping webhook processing.")
                 return
+
+        existing_mentorship = firestore_service.get_subscription(int(telegram_id))
+        if is_mentorship_lifetime(existing_mentorship):
+            logger.info(
+                "Skipping invoice.payment_succeeded for mentorship user %s", telegram_id
+            )
+            return
+
+        if stripe_service.price_id_mentorship:
+            inv_lines = getattr(invoice, "lines", None)
+            inv_data = getattr(inv_lines, "data", None) if inv_lines is not None else None
+            if inv_data:
+                for line in inv_data:
+                    if stripe_service.price_id_mentorship in _price_ids_from_invoice_line(
+                        line
+                    ):
+                        logger.info(
+                            "Skipping invoice.payment_succeeded for mentorship invoice %s",
+                            invoice.id,
+                        )
+                        return
         
         subscription_id = _subscription_id_from_invoice(invoice)
         if subscription_id:
@@ -740,6 +933,13 @@ async def handle_subscription_updated(subscription):
         if not existing_subscription:
             logger.info(f"No existing subscription found for user {telegram_id}, this might be a new subscription. Skipping update.")
             return
+
+        if is_mentorship_lifetime(existing_subscription):
+            logger.info(
+                "Skipping customer.subscription.updated for mentorship user %s",
+                telegram_id,
+            )
+            return
         
         # Check if subscription is still active
         if subscription.status in ['active', 'trialing']:
@@ -824,6 +1024,14 @@ async def handle_subscription_cancelled(subscription):
         # or orphan sub (same customer, different subscription id) must not expire the user or overwrite
         # stripe_subscription_id — e.g. after cleanup scripts or cancel_other_subscriptions_except.
         existing = firestore_service.get_subscription(int(telegram_id))
+        if is_mentorship_lifetime(existing):
+            logger.info(
+                "Ignoring customer.subscription.deleted for mentorship user %s "
+                "(keep VIP; admin removes manually)",
+                telegram_id,
+            )
+            return
+
         tracked_sub_id = existing.get("stripe_subscription_id") if existing else None
         if tracked_sub_id and tracked_sub_id != subscription.id:
             logger.info(
@@ -994,6 +1202,23 @@ async def handle_payment_failed(invoice):
             else:
                 logger.warning(f"No subscription found in Firestore for customer {subscription.customer}. Skipping webhook processing.")
                 return
+
+        mentorship_doc = firestore_service.get_subscription(int(telegram_id))
+        if is_mentorship_lifetime(mentorship_doc):
+            logger.info(
+                "Payment failed on a leftover subscription for mentorship user %s; "
+                "cancelling that Stripe sub but not kicking",
+                telegram_id,
+            )
+            try:
+                stripe.Subscription.cancel(subscription_id)
+            except Exception as e:
+                logger.warning(
+                    "Could not cancel leftover sub %s for mentorship user: %s",
+                    subscription_id,
+                    e,
+                )
+            return
         
         # Cancel the subscription due to payment failure
         try:
@@ -1158,6 +1383,13 @@ async def check_expired_subscriptions():
         for subscription in expired_subscriptions:
             telegram_id = subscription.get('telegram_id')
             if not telegram_id:
+                continue
+
+            if is_mentorship_lifetime(subscription):
+                logger.info(
+                    "Skipping expire/kick (HTTP) for mentorship user telegram_id=%s",
+                    telegram_id,
+                )
                 continue
 
             if stripe_service.is_configured:

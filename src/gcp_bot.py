@@ -22,8 +22,12 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 import stripe
 from stripe import StripeError
 
-from firestore_service import FirestoreService
-from gcp_stripe_service import ActiveSubscriptionExistsError, GCPStripeService
+from firestore_service import FirestoreService, is_mentorship_lifetime
+from gcp_stripe_service import (
+    ActiveSubscriptionExistsError,
+    GCPStripeService,
+    MentorshipUnavailableError,
+)
 
 # Setup Cloud Logging (only on Cloud Run — locally use console logging; avoids wrong quota project from ADC)
 def _running_on_cloud_run() -> bool:
@@ -271,17 +275,35 @@ class GCPTelegramBot:
         )
 
     @staticmethod
-    def _subscription_checkout_message_text() -> str:
-        """Shared copy for checkout (single or multi-plan)."""
-        return (
+    def _subscription_checkout_message_text(
+        *, include_mentorship: bool = False, mentorship_only: bool = False
+    ) -> str:
+        """Shared copy for checkout (single, multi-plan, or mentorship)."""
+        if mentorship_only:
+            return (
+                "🎯 **Mentorship — $850 one-time** (10 spots only)\n\n"
+                "This is **not** a recurring subscription. If you already have a VIP plan, "
+                "we cancel future charges after you pay.\n\n"
+                "✅ VIP access with no automatic removal\n"
+                "✅ Admins remove members from the chats manually\n\n"
+                "Fees are non-refundable unless the 10 spots are already filled."
+            )
+        text = (
             "🎉 **Choose your plan** and pay securely through Stripe.\n\n"
-            "Tap your billing period below. Each plan renews automatically until you cancel.\n\n"
+            "Tap your billing period below. Each recurring plan renews automatically until you cancel.\n\n"
             "✅ Secure payment processing\n"
             "✅ Instant activation\n"
             "✅ Recurring subscription (renews on your plan’s schedule)\n"
             "✅ Auto-renewal (cancel anytime)\n\n"
             "Subscription fees are non-refundable; cancel anytime to stop future charges."
         )
+        if include_mentorship:
+            text += (
+                "\n\n🎯 **Mentorship** is a separate **$850 one-time** package (10 spots). "
+                "It does not auto-renew. If you buy it while you still have a recurring plan, "
+                "we stop future charges."
+            )
+        return text
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /start is issued."""
@@ -367,7 +389,10 @@ class GCPTelegramBot:
             )
 
             start_str = start_date.strftime("%Y-%m-%d %H:%M:%S") if start_date else "N/A"
-            expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S") if expiry_date else "N/A"
+            if is_mentorship_lifetime(subscription):
+                expiry_str = "No automatic expiry (admin removes access)"
+            else:
+                expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S") if expiry_date else "N/A"
 
             message = (
                 f"📊 *Subscription Status*\n\n"
@@ -498,6 +523,96 @@ class GCPTelegramBot:
             
         except Exception as e:
             logger.error(f"Failed to send admin notification for user {user_id}: {e}")
+
+    async def notify_admin_new_payment(
+        self,
+        telegram_id: int,
+        *,
+        username: str | None = None,
+        plan_label: str,
+        payment_kind: str,
+        amount_paid: float | None = None,
+        currency: str | None = None,
+        expiry_date: datetime | None = None,
+        extra_lines: List[str] | None = None,
+    ) -> None:
+        """Tell admins when a new subscription, trial, or one-time payment is issued."""
+        if not self.admin_telegram_ids:
+            logger.warning("No admin Telegram IDs configured. Skipping new-payment admin notification.")
+            return
+
+        user_info = self.firestore_service.get_user(telegram_id)
+        if user_info and user_info.get("username"):
+            display_name = f"@{user_info['username']}"
+        elif username:
+            display_name = f"@{username}"
+        elif user_info:
+            first_name = user_info.get("first_name", "")
+            last_name = user_info.get("last_name", "")
+            display_name = f"{first_name} {last_name}".strip() or f"User {telegram_id}"
+        else:
+            display_name = f"User {telegram_id}"
+
+        kind = (payment_kind or "subscription").lower()
+        if kind == "mentorship" or kind == "one-time":
+            title = "💰 **New one-time payment**"
+            kind_line = "One-time"
+        elif kind == "trial":
+            title = "🆓 **New free trial**"
+            kind_line = "Free trial"
+        else:
+            title = "💳 **New subscription**"
+            kind_line = "Recurring subscription"
+
+        if amount_paid is None:
+            amount_str = "—"
+        elif abs(float(amount_paid) - round(float(amount_paid))) < 0.001:
+            amount_str = f"${int(round(float(amount_paid)))}"
+        else:
+            amount_str = f"${float(amount_paid):.2f}"
+        cur = (currency or "").upper()
+        if cur:
+            amount_str = f"{amount_str} {cur}"
+
+        if kind in ("mentorship", "one-time"):
+            expiry_str = "No automatic expiry (admin removes access)"
+        elif expiry_date is not None and hasattr(expiry_date, "strftime"):
+            expiry_str = expiry_date.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            expiry_str = "—"
+
+        message = (
+            f"{title}\n\n"
+            f"User: {display_name}\n"
+            f"Telegram ID: `{telegram_id}`\n"
+            f"Type: {kind_line}\n"
+            f"Plan: {plan_label}\n"
+            f"Amount: {amount_str}\n"
+            f"Access until: {expiry_str}\n"
+            f"Time: {datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        if extra_lines:
+            message += "\n" + "\n".join(extra_lines)
+
+        for admin_id in self.admin_telegram_ids:
+            try:
+                await self.application.bot.send_message(
+                    chat_id=admin_id,
+                    text=message,
+                    parse_mode="Markdown",
+                )
+                logger.info(
+                    "Admin new-payment notification sent to %s for user %s (%s)",
+                    admin_id,
+                    telegram_id,
+                    plan_label,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to send new-payment notification to admin %s: %s",
+                    admin_id,
+                    e,
+                )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a message when the command /help is issued."""
@@ -743,6 +858,18 @@ Contact AM if you have any questions about your subscription.
                     parse_mode="Markdown",
                 )
                 return
+
+            if is_mentorship_lifetime(subscription):
+                await self._reply_private_ui(
+                    update,
+                    "🎯 **Mentorship package**\n\n"
+                    "This is a one-time payment. Recurring VIP billing is already off, "
+                    "and you will not be auto-removed from the groups.\n\n"
+                    "Ask an admin if you need to leave the VIP chats.",
+                    reply_markup=cb_markup,
+                    parse_mode="Markdown",
+                )
+                return
             
             # Check if subscription is already cancelled
             metadata = subscription.get('metadata', {})
@@ -869,6 +996,11 @@ Contact AM if you have any questions about your subscription.
             exc_info=True,
         )
         back = self._back_only_markup()
+        if isinstance(e, MentorshipUnavailableError):
+            await self._edit_menu_message(
+                query.message, str(e), reply_markup=back
+            )
+            return
         if isinstance(e, ActiveSubscriptionExistsError):
             await self._edit_menu_message(
                 query.message, str(e), reply_markup=back
@@ -951,10 +1083,16 @@ Contact AM if you have any questions about your subscription.
         user_id: int,
         username: str | None,
         plans: List[Dict[str, str]],
+        *,
+        include_mentorship: bool = False,
     ) -> None:
         """Single message: intro text + one Stripe Checkout URL button per plan."""
         existing_subscription = self._subscription_precheck_sync_stripe(user_id)
-        if existing_subscription and existing_subscription.get("status") == "active":
+        if (
+            existing_subscription
+            and existing_subscription.get("status") == "active"
+            and not include_mentorship
+        ):
             expiry_date = existing_subscription["expiry_date"]
             await self._edit_menu_message(
                 query.message,
@@ -981,20 +1119,39 @@ Contact AM if you have any questions about your subscription.
 
         rows: list = []
         first_error: Exception | None = None
-        for p in plans:
+        skip_recurring = bool(
+            existing_subscription and existing_subscription.get("status") == "active"
+        )
+        if not skip_recurring:
+            for p in plans:
+                try:
+                    url = self.stripe_service.create_subscription_checkout(
+                        user_id, username, price_id=p["price_id"]
+                    )
+                    rows.append([InlineKeyboardButton(f"💳 {p['label']}", url=url)])
+                except Exception as e:
+                    if first_error is None:
+                        first_error = e
+                    logger.error(
+                        "Checkout session failed for plan %s",
+                        p.get("key"),
+                        exc_info=True,
+                    )
+
+        if include_mentorship:
             try:
-                url = self.stripe_service.create_subscription_checkout(
-                    user_id, username, price_id=p["price_id"]
+                murl = self.stripe_service.create_mentorship_checkout(user_id, username)
+                rows.append(
+                    [InlineKeyboardButton("🎯 Mentorship — $850", url=murl)]
                 )
-                rows.append([InlineKeyboardButton(f"💳 {p['label']}", url=url)])
+            except MentorshipUnavailableError as e:
+                if first_error is None:
+                    first_error = e
+                logger.info("Mentorship checkout unavailable: %s", e)
             except Exception as e:
                 if first_error is None:
                     first_error = e
-                logger.error(
-                    "Checkout session failed for plan %s",
-                    p.get("key"),
-                    exc_info=True,
-                )
+                logger.error("Mentorship checkout session failed", exc_info=True)
 
         if not rows:
             await self._reply_stripe_checkout_error(
@@ -1005,10 +1162,52 @@ Contact AM if you have any questions about your subscription.
         reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(rows))
         await self._edit_menu_message(
             query.message,
-            self._subscription_checkout_message_text(),
+            self._subscription_checkout_message_text(include_mentorship=include_mentorship),
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
+
+    async def _reply_mentorship_checkout(
+        self,
+        query,
+        user_id: int,
+        username: str | None,
+    ) -> None:
+        if not self.stripe_service.is_configured:
+            await self._edit_menu_message(
+                query.message,
+                "Mentorship checkout is not available right now. Please try again later.",
+                reply_markup=self._back_only_markup(),
+            )
+            return
+        if self.firestore_service.user_has_mentorship(user_id):
+            await self._edit_menu_message(
+                query.message,
+                "You already have the mentorship package. VIP access stays until an admin removes you.",
+                reply_markup=self._back_only_markup(),
+            )
+            return
+        if self.firestore_service.mentorship_spots_remaining() <= 0:
+            await self._edit_menu_message(
+                query.message,
+                "Mentorship is sold out (10 spots).",
+                reply_markup=self._back_only_markup(),
+            )
+            return
+        try:
+            payment_url = self.stripe_service.create_mentorship_checkout(user_id, username)
+            keyboard = [
+                [InlineKeyboardButton("🎯 Mentorship — $850", url=payment_url)]
+            ]
+            reply_markup = self._keyboard_with_back(InlineKeyboardMarkup(keyboard))
+            await self._edit_menu_message(
+                query.message,
+                self._subscription_checkout_message_text(mentorship_only=True),
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await self._reply_stripe_checkout_error(query, user_id, e)
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button callbacks."""
@@ -1063,7 +1262,33 @@ Contact AM if you have any questions about your subscription.
             user_id = update.effective_user.id
             username = update.effective_user.username
             existing_subscription = self._subscription_precheck_sync_stripe(user_id)
-            if existing_subscription and existing_subscription.get("status") == "active":
+            mentorship_opt = self.stripe_service.get_mentorship_plan_option()
+            already_mentorship = self.firestore_service.user_has_mentorship(user_id)
+            mentorship_available = bool(
+                mentorship_opt
+                and not already_mentorship
+                and self.firestore_service.mentorship_spots_remaining() > 0
+            )
+
+            if already_mentorship:
+                await self._edit_menu_message(
+                    query.message,
+                    "🎯 **Mentorship already active**\n\n"
+                    "You already have the mentorship package. VIP access stays until "
+                    "an admin removes you from the groups.",
+                    reply_markup=self._back_only_markup(),
+                    parse_mode="Markdown",
+                )
+                return
+
+            if (
+                existing_subscription
+                and existing_subscription.get("status") == "active"
+                and not is_mentorship_lifetime(existing_subscription)
+            ):
+                if mentorship_available:
+                    await self._reply_mentorship_checkout(query, user_id, username)
+                    return
                 expiry_date = existing_subscription["expiry_date"]
                 await self._edit_menu_message(
                     query.message,
@@ -1078,9 +1303,13 @@ Contact AM if you have any questions about your subscription.
                 return
 
             plans = self.stripe_service.get_subscription_plan_options()
-            if len(plans) > 1:
+            if len(plans) > 1 or mentorship_available:
                 await self._reply_subscription_checkouts_combined(
-                    query, user_id, username, plans
+                    query,
+                    user_id,
+                    username,
+                    plans,
+                    include_mentorship=mentorship_available,
                 )
                 return
 
@@ -1117,7 +1346,7 @@ Contact AM if you have any questions about your subscription.
                     query.message,
                     f"❌ **Free Trial Already Used**\n\n"
                     f"You have already used your free trial. Free trials are limited to one per user.\n\n"
-                    f"Click the Subscribe button to get full VIP access with our monthly subscription!",
+                    f"Click the Subscribe button to get full VIP access with one of our subscription plans!",
                     reply_markup=self._back_only_markup(),
                     parse_mode="Markdown",
                 )
@@ -1264,6 +1493,13 @@ Contact AM if you have any questions about your subscription.
             for subscription in expired_subscriptions:
                 telegram_id = subscription.get("telegram_id")
                 if not telegram_id:
+                    continue
+
+                if is_mentorship_lifetime(subscription):
+                    logger.info(
+                        "Skipping expire/kick for mentorship user telegram_id=%s",
+                        telegram_id,
+                    )
                     continue
 
                 # Stripe is source of truth: if still entitled in Stripe, refresh Firestore and do not kick

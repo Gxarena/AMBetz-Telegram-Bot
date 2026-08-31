@@ -14,6 +14,21 @@ logger = logging.getLogger(__name__)
 # does not re-queue the same "stale expired" row on every cron run.
 VIP_REMOVAL_COMPLETED_AT = "vip_removal_completed_at"
 
+MENTORSHIP_MAX_SPOTS = 10
+MENTORSHIP_OFFER_ID = "mentorship"
+# Firestore still requires an expiry_date; kick/expire paths skip mentorship regardless.
+MENTORSHIP_EXPIRY_SENTINEL = datetime(2099, 12, 31, 23, 59, 59, tzinfo=pytz.UTC)
+
+
+def is_mentorship_lifetime(doc: Optional[Dict[str, Any]]) -> bool:
+    """True when this user bought the one-time mentorship package (no auto-kick)."""
+    if not doc:
+        return False
+    if (doc.get("subscription_type") or "").lower() == "mentorship":
+        return True
+    meta = doc.get("metadata") or {}
+    return isinstance(meta, dict) and bool(meta.get("is_mentorship"))
+
 class FirestoreService:
     def __init__(self, project_id: str = None):
         """Initialize Firestore client"""
@@ -206,6 +221,91 @@ class FirestoreService:
             logger.error(f"Error getting subscription for user {telegram_id}: {e}")
             return None
 
+    def get_mentorship_offer(self) -> Dict[str, Any]:
+        """sold_count / max_spots for the limited mentorship package."""
+        try:
+            snap = self.db.collection("offers").document(MENTORSHIP_OFFER_ID).get()
+            if snap.exists:
+                data = snap.to_dict() or {}
+                sold = int(data.get("sold_count") or 0)
+                max_spots = int(data.get("max_spots") or MENTORSHIP_MAX_SPOTS)
+                return {"sold_count": sold, "max_spots": max_spots}
+        except Exception as e:
+            logger.error("Error reading mentorship offer: %s", e)
+        return {"sold_count": 0, "max_spots": MENTORSHIP_MAX_SPOTS}
+
+    def mentorship_spots_remaining(self) -> int:
+        offer = self.get_mentorship_offer()
+        return max(0, int(offer["max_spots"]) - int(offer["sold_count"]))
+
+    def user_has_mentorship(self, telegram_id: int) -> bool:
+        if is_mentorship_lifetime(self.get_subscription(telegram_id)):
+            return True
+        try:
+            snap = (
+                self.db.collection("mentorship_purchases")
+                .document(str(telegram_id))
+                .get()
+            )
+            return bool(snap.exists)
+        except Exception as e:
+            logger.error("Error checking mentorship purchase for %s: %s", telegram_id, e)
+            return False
+
+    def claim_mentorship_spot(self, telegram_id: int, stripe_session_id: str) -> str:
+        """
+        Atomically take one of 10 mentorship spots.
+        Returns 'claimed', 'already', 'duplicate_payment', or 'sold_out'.
+        """
+        offer_ref = self.db.collection("offers").document(MENTORSHIP_OFFER_ID)
+        purchase_ref = self.db.collection("mentorship_purchases").document(
+            str(telegram_id)
+        )
+
+        @firestore.transactional
+        def _txn(transaction):
+            purchase = purchase_ref.get(transaction=transaction)
+            if purchase.exists:
+                existing_sid = (purchase.to_dict() or {}).get("stripe_session_id")
+                if existing_sid == stripe_session_id:
+                    return "already"
+                return "duplicate_payment"
+            offer = offer_ref.get(transaction=transaction)
+            sold = 0
+            max_spots = MENTORSHIP_MAX_SPOTS
+            if offer.exists:
+                data = offer.to_dict() or {}
+                sold = int(data.get("sold_count") or 0)
+                max_spots = int(data.get("max_spots") or MENTORSHIP_MAX_SPOTS)
+            if sold >= max_spots:
+                return "sold_out"
+            transaction.set(
+                purchase_ref,
+                {
+                    "telegram_id": telegram_id,
+                    "stripe_session_id": stripe_session_id,
+                    "purchased_at": datetime.now(pytz.UTC),
+                },
+            )
+            transaction.set(
+                offer_ref,
+                {
+                    "sold_count": sold + 1,
+                    "max_spots": max_spots,
+                    "updated_at": datetime.utcnow(),
+                },
+                merge=True,
+            )
+            return "claimed"
+
+        try:
+            return _txn(self.db.transaction())
+        except Exception as e:
+            logger.error(
+                "Error claiming mentorship spot for %s: %s", telegram_id, e, exc_info=True
+            )
+            raise
+
     def find_expired_subscriptions(self) -> List[Dict]:
         """
         Subscriptions for which the VIP expirer should run: billing period is over, but we
@@ -250,6 +350,9 @@ class FirestoreService:
                     expiry_date = pytz.UTC.localize(expiry_date)
                     sub_data['expiry_date'] = expiry_date
                 
+                if is_mentorship_lifetime(sub_data):
+                    continue
+
                 # CRITICAL: If subscription has a stripe_subscription_id (recurring), add a grace period
                 # This prevents race conditions where Stripe renewal webhook fires just before expiry check
                 # Give 5 minutes grace period for Firestore to update from webhook
@@ -292,6 +395,8 @@ class FirestoreService:
             try:
                 for doc in q_stale.stream():
                     sub_data = doc.to_dict()
+                    if is_mentorship_lifetime(sub_data):
+                        continue
                     if sub_data.get(VIP_REMOVAL_COMPLETED_AT):
                         continue
                     tid = int(doc.id)
@@ -378,7 +483,14 @@ class FirestoreService:
         """
         try:
             doc_ref = self.db.collection("subscriptions").document(str(telegram_id))
-            if not doc_ref.get().exists:
+            snap = doc_ref.get()
+            if not snap.exists:
+                return False
+            if is_mentorship_lifetime(snap.to_dict()):
+                logger.info(
+                    "Skipping Stripe sync for mentorship user telegram_id=%s",
+                    telegram_id,
+                )
                 return False
             upd: Dict[str, Any] = {
                 "start_date": start_date,
